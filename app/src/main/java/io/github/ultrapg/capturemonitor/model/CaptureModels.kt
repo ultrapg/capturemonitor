@@ -133,7 +133,7 @@ data class VideoMode(
 }
 
 /**
- * Known capture card profiles with specialized support for Magewell, Elgato, AVerMedia, MacroSilicon, Genki, etc.
+ * Known capture card profiles with specialized support for Magewell, Elgato, AVerMedia, MacroSilicon, etc.
  */
 enum class CaptureCardVendor(
     val vendorId: Int,
@@ -194,8 +194,11 @@ enum class AspectRatioPreset(val label: String, val ratio: Float?) {
     RATIO_4_3("4:3 Retro / iPad", 4f / 3f)
 }
 
+/**
+ * Texture filtering mode. Defaults to LINEAR (`Linear`) as requested.
+ */
 enum class TextureFilteringMode(val label: String, val description: String) {
-    BILINEAR("Smooth Bilinear + CAS", "Hardware bilinear filtering with Contrast-Adaptive Sharpening"),
+    LINEAR("Linear", "Hardware GL_LINEAR texture filtering with optional CAS sharpening (Default)"),
     NEAREST_PIXEL("Pixel-Perfect Integer", "Nearest-neighbor crisp pixels for retro consoles & pixel art")
 }
 
@@ -208,11 +211,11 @@ enum class ColorSpaceMode(val label: String, val code: Int) {
 
 /**
  * Hardware-accelerated GPU shader & viewport configuration.
- * Defaults to STRETCH_FILL so the entire phone/tablet screen is used out of the box.
+ * Defaults to STRETCH_FILL and LINEAR filtering so the entire phone/tablet screen is used out of the box.
  */
 data class RenderConfig(
     val aspectRatioPreset: AspectRatioPreset = AspectRatioPreset.STRETCH_FILL,
-    val filteringMode: TextureFilteringMode = TextureFilteringMode.BILINEAR,
+    val filteringMode: TextureFilteringMode = TextureFilteringMode.LINEAR,
     val colorSpace: ColorSpaceMode = ColorSpaceMode.REC_709,
     val fullRangeRgb: Boolean = true,
     val brightness: Float = 0.0f,     // -0.5 to +0.5
@@ -238,8 +241,8 @@ data class RenderConfig(
 data class HostDisplayInfo(
     val physicalWidth: Int = 1920,
     val physicalHeight: Int = 1080,
-    val maxRefreshRateHz: Int = 60,
-    val supportedRefreshRatesHz: List<Int> = listOf(60)
+    val maxRefreshRateHz: Int = 120,
+    val supportedRefreshRatesHz: List<Int> = listOf(120, 90, 60)
 ) {
     val label: String
         get() = "${physicalWidth}×${physicalHeight} @ ${maxRefreshRateHz}Hz"

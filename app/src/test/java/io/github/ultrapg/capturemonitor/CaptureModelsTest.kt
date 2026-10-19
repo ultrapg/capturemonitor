@@ -3,6 +3,7 @@ package io.github.ultrapg.capturemonitor
 import io.github.ultrapg.capturemonitor.model.AspectRatioPreset
 import io.github.ultrapg.capturemonitor.model.CaptureCardVendor
 import io.github.ultrapg.capturemonitor.model.RenderConfig
+import io.github.ultrapg.capturemonitor.model.TextureFilteringMode
 import io.github.ultrapg.capturemonitor.model.UsbStandard
 import io.github.ultrapg.capturemonitor.model.VideoFormat
 import io.github.ultrapg.capturemonitor.model.VideoMode
@@ -22,12 +23,14 @@ class CaptureModelsTest {
     }
 
     @Test
-    fun defaultUiStateHasHiddenHudAndMenuAndFullScreenStretchFill() {
+    fun defaultUiStateHasHiddenHudAndMenuFullScreenStretchAndLinearFilter() {
         val state = MonitorUiState()
         assertFalse(state.isPanelOpen)
         assertFalse(state.showHudOverlay)
         assertFalse(state.isCaptureCardConnected)
         assertEquals(AspectRatioPreset.STRETCH_FILL, RenderConfig().aspectRatioPreset)
+        assertEquals(TextureFilteringMode.LINEAR, RenderConfig().filteringMode)
+        assertEquals("Linear", RenderConfig().filteringMode.label)
     }
 
     @Test

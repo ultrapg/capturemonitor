@@ -287,38 +287,42 @@ class UsbCaptureDiscovery(
     }
 
     /**
-     * Selects the highest resolution and refresh rate supported by BOTH the Android device's screen
-     * and the connected capture card's capabilities.
+     * Selects the highest resolution and refresh rate (90Hz / 120Hz / 144Hz / 240Hz) supported by
+     * BOTH the Android device's screen and the connected capture card.
      */
     fun selectBestDefaultMode(
         device: CaptureDeviceInfo?,
         hostDisplay: HostDisplayInfo
     ): VideoMode {
-        val nativeCandidates = device?.supportedModes?.filter { it.isNativeReported && it.format == VideoFormat.MJPEG }
+        val candidates = device?.supportedModes?.filter { it.format == VideoFormat.MJPEG }
             ?.takeIf { it.isNotEmpty() }
             ?: ALL_STANDARD_MODES.filter { it.format == VideoFormat.MJPEG }
 
-        val targetPixels = hostDisplay.physicalWidth.toLong() * hostDisplay.physicalHeight.toLong()
+        val targetW = hostDisplay.physicalWidth.coerceIn(1280, 3840)
+        val targetH = hostDisplay.physicalHeight.coerceIn(720, 2160)
+        val targetPixels = targetW.toLong() * targetH.toLong()
         val targetHz = hostDisplay.maxRefreshRateHz.coerceIn(60, 240)
+        val usbStd = device?.usbStandard ?: UsbStandard.USB_3_0_GEN1
 
-        // Pick the highest resolution up to (or closest to) the host screen resolution and highest refresh rate
-        return nativeCandidates.maxWithOrNull(
+        // Prefer the highest refresh rate up to the display's native max Hz (e.g. 90Hz, 120Hz, 144Hz, 240Hz)
+        // and the highest resolution up to the display's physical resolution that fits USB bandwidth.
+        return candidates.maxWithOrNull(
             compareBy<VideoMode> { mode ->
+                !mode.exceedsUsbBandwidth(usbStd)
+            }.thenBy { mode ->
+                // Exact or highest refresh rate up to the display's max refresh rate (90Hz / 120Hz / 144Hz)
+                if (mode.fps <= targetHz) mode.fps else (targetHz - abs(mode.fps - targetHz)).coerceAtLeast(1)
+            }.thenBy { mode ->
                 val modePixels = mode.width.toLong() * mode.height.toLong()
-                // Prefer modes that match or are up to 4K, prioritizing closest to or exceeding host screen up to 4K
-                val fitsUsb = !mode.exceedsUsbBandwidth(device?.usbStandard ?: UsbStandard.USB_3_0_GEN1)
-                val usbScore = if (fitsUsb) 1_000_000_000L else 0L
-                val fpsScore = if (mode.fps <= targetHz) mode.fps * 10_000_000L else (targetHz - abs(mode.fps - targetHz)) * 5_000_000L
-                val resScore = if (modePixels <= targetPixels.coerceAtLeast(1920L * 1080L)) {
+                if (modePixels <= targetPixels) {
                     modePixels
                 } else {
                     targetPixels - (modePixels - targetPixels) / 2
                 }
-                usbScore + fpsScore + resScore
             }
         ) ?: VideoMode(
-            width = hostDisplay.physicalWidth.coerceIn(1920, 3840),
-            height = hostDisplay.physicalHeight.coerceIn(1080, 2160),
+            width = targetW,
+            height = targetH,
             fps = targetHz,
             format = VideoFormat.MJPEG
         )

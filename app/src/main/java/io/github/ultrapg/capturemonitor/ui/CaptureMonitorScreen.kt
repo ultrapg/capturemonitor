@@ -250,6 +250,18 @@ fun CaptureMonitorScreen(
                     renderMode = GLSurfaceView.RENDERMODE_CONTINUOUSLY
                     rendererRef = renderer
                 }
+            },
+            update = { glView ->
+                if (android.os.Build.VERSION.SDK_INT >= android.os.Build.VERSION_CODES.R) {
+                    val targetHz = maxOf(state.hostDisplay.maxRefreshRateHz, state.selectedMode.fps).toFloat()
+                    try {
+                        glView.holder.surface?.takeIf { it.isValid }?.setFrameRate(
+                            targetHz,
+                            android.view.Surface.FRAME_RATE_COMPATIBILITY_DEFAULT
+                        )
+                    } catch (_: Exception) {
+                    }
+                }
             }
         )
 
@@ -634,7 +646,7 @@ private fun SlideOverMonitorControlPanel(
                         color = Color.White
                     )
                     Text(
-                        text = "Swipe edge or press Back to hide • v0.2.0",
+                        text = "Swipe edge or press Back to hide • v0.3.0",
                         fontSize = 11.sp,
                         color = Color(0xFF94A3B8)
                     )
@@ -833,6 +845,14 @@ private fun SignalAndUsbTab(
         icon = Icons.Default.Hd
     ) {
         val allPresets = buildList {
+            // Always include the Android device's exact physical screen resolution at the top
+            add(
+                Triple(
+                    state.hostDisplay.physicalWidth,
+                    state.hostDisplay.physicalHeight,
+                    "Device Screen (${state.hostDisplay.physicalWidth}×${state.hostDisplay.physicalHeight})"
+                )
+            )
             state.customModes.forEach { custom ->
                 add(Triple(custom.width, custom.height, "Custom (${custom.width}×${custom.height})"))
             }
