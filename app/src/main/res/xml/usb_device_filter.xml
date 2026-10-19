@@ -1,0 +1,15 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <!-- Magewell USB Capture HDMI / Pro / Plus / AIO (Vendor ID 0x2935 = 10549) -->
+    <usb-device vendor-id="10549" />
+    <!-- Elgato Systems (Vendor ID 0x0fd9 = 4057) -->
+    <usb-device vendor-id="4057" />
+    <!-- AVerMedia Technologies (Vendor ID 0x07ca = 1994) -->
+    <usb-device vendor-id="1994" />
+    <!-- MacroSilicon MS2109 / MS2130 HDMI USB Capture (Vendor ID 0x534d = 21325, 0x345f = 13407) -->
+    <usb-device vendor-id="21325" />
+    <usb-device vendor-id="13407" />
+    <!-- Standard USB Video Class (UVC: Class 14 = 0x0E, Class 239 = 0xEF Misc IAD) -->
+    <usb-device class="14" />
+    <usb-device class="239" subclass="2" protocol="1" />
+</resources>
