@@ -4,9 +4,8 @@ import android.app.Application
 import androidx.lifecycle.AndroidViewModel
 import androidx.lifecycle.viewModelScope
 import io.github.ultrapg.capturemonitor.audio.UsbAudioLoopbackEngine
-import io.github.ultrapg.capturemonitor.model.AspectRatioPreset
 import io.github.ultrapg.capturemonitor.model.CaptureDeviceInfo
-import io.github.ultrapg.capturemonitor.model.ColorSpaceMode
+import io.github.ultrapg.capturemonitor.model.HostDisplayInfo
 import io.github.ultrapg.capturemonitor.model.RenderConfig
 import io.github.ultrapg.capturemonitor.model.StreamTelemetry
 import io.github.ultrapg.capturemonitor.model.UsbStandard
@@ -22,21 +21,32 @@ import kotlinx.coroutines.launch
 data class MonitorUiState(
     val devices: List<CaptureDeviceInfo> = emptyList(),
     val selectedDevice: CaptureDeviceInfo? = null,
+    val hostDisplay: HostDisplayInfo = HostDisplayInfo(3840, 2160, 120, listOf(60, 90, 120)),
     val selectedMode: VideoMode = VideoMode(1920, 1080, 60, VideoFormat.MJPEG),
+    val customModes: List<VideoMode> = emptyList(),
     val simulatedUsbPortStandard: UsbStandard? = null,
     val forceBypassUsbLimits: Boolean = false,
     val renderConfig: RenderConfig = RenderConfig(),
     val telemetry: StreamTelemetry = StreamTelemetry(),
-    val isPanelOpen: Boolean = true,
-    val showHudOverlay: Boolean = true,
+    // Both Menu Drawer and HUD are completely hidden by default so 100% of the screen is utilized!
+    val isPanelOpen: Boolean = false,
+    val showHudOverlay: Boolean = false,
+    val isReceivingLiveFrames: Boolean = false,
     val audioPassthroughEnabled: Boolean = true,
     val audioVolume: Float = 1.0f,
+    val audioNoiseGateDb: Float = -58f,
     val isAudioMuted: Boolean = false,
     val audioPeakLevel: Float = 0f,
     val hasCameraPermission: Boolean = false,
     val hasAudioPermission: Boolean = false,
     val bannerMessage: String? = null
 ) {
+    /**
+     * True only when a physical USB capture card or external UVC device is actually plugged in.
+     */
+    val isCaptureCardConnected: Boolean
+        get() = selectedDevice != null && !selectedDevice.isSimulated
+
     val effectiveUsbStandard: UsbStandard
         get() = simulatedUsbPortStandard ?: selectedDevice?.usbStandard ?: UsbStandard.USB_3_0_GEN1
 
@@ -52,31 +62,75 @@ class MonitorViewModel(application: Application) : AndroidViewModel(application)
     private val _uiState = MutableStateFlow(MonitorUiState())
     val uiState: StateFlow<MonitorUiState> = _uiState.asStateFlow()
 
+    private var hasUserManuallyChosenMode = false
+
     private val usbDiscovery = UsbCaptureDiscovery(application) {
         refreshDevices()
     }
 
-    private val audioEngine = UsbAudioLoopbackEngine(application) { rmsLevel ->
-        _uiState.update { it.copy(audioPeakLevel = rmsLevel) }
+    private val audioEngine = UsbAudioLoopbackEngine(application) { rmsLevel, usbAudioName ->
+        _uiState.update { state ->
+            state.copy(
+                audioPeakLevel = rmsLevel,
+                telemetry = state.telemetry.copy(usbAudioDeviceName = usbAudioName)
+            )
+        }
     }
 
     init {
         usbDiscovery.register()
+        audioEngine.register()
         refreshDevices()
+    }
+
+    /**
+     * Called by MainActivity once the Android display's native resolution and maximum refresh rate
+     * (e.g., 120Hz / 144Hz / 240Hz) are queried. Automatically selects the highest supported
+     * resolution and refresh rate for the device and capture card by default.
+     */
+    fun onHostDisplayDetected(displayInfo: HostDisplayInfo) {
+        _uiState.update { state ->
+            val bestMode = if (!hasUserManuallyChosenMode) {
+                usbDiscovery.selectBestDefaultMode(state.selectedDevice, displayInfo)
+            } else {
+                state.selectedMode
+            }
+            state.copy(
+                hostDisplay = displayInfo,
+                selectedMode = bestMode
+            )
+        }
     }
 
     fun refreshDevices() {
         viewModelScope.launch {
             val found = usbDiscovery.discoverCaptureDevices()
+            val previouslyConnectedId = _uiState.value.selectedDevice?.id
+
             _uiState.update { current ->
                 val chosen = found.firstOrNull { it.id == current.selectedDevice?.id }
-                    ?: found.firstOrNull { !it.isSimulated }
                     ?: found.firstOrNull()
+
+                val bestMode = if (!hasUserManuallyChosenMode && (chosen != null && chosen.id != previouslyConnectedId)) {
+                    usbDiscovery.selectBestDefaultMode(chosen, current.hostDisplay)
+                } else {
+                    current.selectedMode
+                }
+
                 current.copy(
                     devices = found,
-                    selectedDevice = chosen
+                    selectedDevice = chosen,
+                    selectedMode = bestMode,
+                    telemetry = current.telemetry.copy(
+                        negotiateStatus = if (chosen != null) "Locked (${chosen.usbStandard.specName})" else "No Capture Card"
+                    )
                 )
             }
+
+            // Immediately update the audio engine with whether a physical capture card is attached
+            val isPhysicalConnected = _uiState.value.isCaptureCardConnected
+            audioEngine.isCaptureCardPhysicallyConnected = isPhysicalConnected
+            audioEngine.syncAudioState()
         }
     }
 
@@ -87,35 +141,54 @@ class MonitorViewModel(application: Application) : AndroidViewModel(application)
                 hasAudioPermission = audioGranted
             )
         }
-        if (audioGranted && _uiState.value.audioPassthroughEnabled) {
-            audioEngine.start()
-        }
+        audioEngine.hasAudioPermission = audioGranted
         refreshDevices()
     }
 
+    fun requestUsbPermissionForCurrentDevice() {
+        val dev = _uiState.value.selectedDevice ?: return
+        usbDiscovery.requestPermissionForDeviceInfo(dev)
+    }
+
     fun selectDevice(device: CaptureDeviceInfo) {
+        val bestMode = if (!hasUserManuallyChosenMode) {
+            usbDiscovery.selectBestDefaultMode(device, _uiState.value.hostDisplay)
+        } else {
+            _uiState.value.selectedMode
+        }
         _uiState.update {
             it.copy(
                 selectedDevice = device,
+                selectedMode = bestMode,
                 simulatedUsbPortStandard = null,
-                bannerMessage = "Switched input to ${device.name} (${device.usbVersionString})"
+                bannerMessage = "Connected to ${device.name} (${device.usbVersionString})"
             )
         }
+        audioEngine.isCaptureCardPhysicallyConnected = !device.isSimulated
+        audioEngine.syncAudioState()
     }
 
     fun selectResolutionAndFps(
         width: Int = _uiState.value.selectedMode.width,
         height: Int = _uiState.value.selectedMode.height,
         fps: Int = _uiState.value.selectedMode.fps,
-        format: VideoFormat = _uiState.value.selectedMode.format
+        format: VideoFormat = _uiState.value.selectedMode.format,
+        isCustom: Boolean = false
     ) {
-        val candidate = VideoMode(width, height, fps, format)
+        hasUserManuallyChosenMode = true
+        val candidate = VideoMode(width, height, fps, format, isNativeReported = !isCustom, isCustom = isCustom)
         val usbStd = _uiState.value.effectiveUsbStandard
         val exceeds = candidate.exceedsUsbBandwidth(usbStd)
 
         _uiState.update { state ->
+            val updatedCustomModes = if (isCustom && state.customModes.none { it.width == width && it.height == height && it.fps == fps }) {
+                listOf(candidate) + state.customModes
+            } else {
+                state.customModes
+            }
+
             val msg = if (exceeds && !state.forceBypassUsbLimits) {
-                "Port limit warning: ${candidate.resolutionLabel}@${candidate.fps}Hz (${candidate.format.shortName}) requires ~${candidate.requiredMbps} Mbps, exceeding ${usbStd.specName} practical ceiling (${usbStd.maxPracticalPayloadMbps} Mbps). Enable 'Force Mode' or switch to MJPEG."
+                "Port limit warning: ${candidate.resolutionLabel}@${candidate.fps}Hz (${candidate.format.shortName}) requires ~${candidate.requiredMbps} Mbps, exceeding ${usbStd.specName} (${usbStd.maxPracticalPayloadMbps} Mbps). Enable 'Force Mode' or use MJPEG."
             } else if (exceeds && state.forceBypassUsbLimits) {
                 "Forcing ${candidate.resolutionLabel}@${candidate.fps}Hz (${candidate.format.shortName}) over ${usbStd.specName} via UVC VS_COMMIT_CONTROL override."
             } else {
@@ -124,6 +197,7 @@ class MonitorViewModel(application: Application) : AndroidViewModel(application)
 
             state.copy(
                 selectedMode = candidate,
+                customModes = updatedCustomModes,
                 telemetry = state.telemetry.copy(
                     estimatedBitrateMbps = candidate.requiredMbps.toFloat(),
                     isForcedModeActive = exceeds && state.forceBypassUsbLimits,
@@ -136,6 +210,21 @@ class MonitorViewModel(application: Application) : AndroidViewModel(application)
         if (_uiState.value.forceBypassUsbLimits || !exceeds) {
             applyUvcNegotiation(candidate, _uiState.value.forceBypassUsbLimits)
         }
+    }
+
+    /**
+     * Matches the capture card target resolution and refresh rate directly to the Android device's
+     * native physical screen resolution and maximum refresh rate.
+     */
+    fun matchHostScreenResolutionAndHz() {
+        val host = _uiState.value.hostDisplay
+        selectResolutionAndFps(
+            width = host.physicalWidth,
+            height = host.physicalHeight,
+            fps = host.maxRefreshRateHz,
+            format = _uiState.value.selectedMode.format,
+            isCustom = true
+        )
     }
 
     fun setForceBypassUsbLimits(force: Boolean) {
@@ -158,7 +247,7 @@ class MonitorViewModel(application: Application) : AndroidViewModel(application)
     }
 
     private fun applyUvcNegotiation(mode: VideoMode, ignoreBandwidthCeiling: Boolean) {
-        val device = _uiState.value.selectedDevice ?: return
+        val device = _uiState.value.selectedDevice
         viewModelScope.launch {
             val result = usbDiscovery.forceUvcStreamNegotiation(
                 deviceInfo = device,
@@ -211,18 +300,15 @@ class MonitorViewModel(application: Application) : AndroidViewModel(application)
         _uiState.update {
             it.copy(
                 renderConfig = RenderConfig(),
-                bannerMessage = "Reset GPU shader grading & viewport geometry to reference defaults"
+                bannerMessage = "Reset GPU shader grading & full-screen geometry to defaults"
             )
         }
     }
 
     fun setAudioPassthrough(enabled: Boolean) {
+        audioEngine.userEnabled = enabled
         _uiState.update { it.copy(audioPassthroughEnabled = enabled) }
-        if (enabled && _uiState.value.hasAudioPermission) {
-            audioEngine.start()
-        } else {
-            audioEngine.stop()
-        }
+        audioEngine.syncAudioState()
     }
 
     fun setAudioVolume(volume: Float) {
@@ -231,16 +317,27 @@ class MonitorViewModel(application: Application) : AndroidViewModel(application)
         _uiState.update { it.copy(audioVolume = clamped) }
     }
 
+    fun setAudioNoiseGateDb(db: Float) {
+        val clamped = db.coerceIn(-90f, -20f)
+        audioEngine.noiseGateDb = clamped
+        _uiState.update { it.copy(audioNoiseGateDb = clamped) }
+    }
+
     fun toggleAudioMute() {
         val nextMute = !_uiState.value.isAudioMuted
         audioEngine.isMuted = nextMute
         _uiState.update { it.copy(isAudioMuted = nextMute) }
     }
 
-    fun onRendererTelemetry(fps: Float, frameTimeMs: Float) {
+    fun onRendererTelemetry(fps: Float, frameTimeMs: Float, isReceivingLiveFrames: Boolean) {
         _uiState.update { state ->
-            val bitrate = state.selectedMode.requiredMbps.toFloat()
+            val bitrate = if (state.isCaptureCardConnected || state.renderConfig.showTestPatternWhenNoSignal) {
+                state.selectedMode.requiredMbps.toFloat()
+            } else {
+                0f
+            }
             state.copy(
+                isReceivingLiveFrames = isReceivingLiveFrames,
                 telemetry = state.telemetry.copy(
                     currentFps = fps,
                     frameTimeMs = frameTimeMs,
@@ -257,6 +354,6 @@ class MonitorViewModel(application: Application) : AndroidViewModel(application)
     override fun onCleared() {
         super.onCleared()
         usbDiscovery.unregister()
-        audioEngine.stop()
+        audioEngine.unregister()
     }
 }

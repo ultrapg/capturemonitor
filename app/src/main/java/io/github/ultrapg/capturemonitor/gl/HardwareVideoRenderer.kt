@@ -18,6 +18,7 @@ import android.util.Range
 import android.view.Surface
 import io.github.ultrapg.capturemonitor.model.AspectRatioPreset
 import io.github.ultrapg.capturemonitor.model.RenderConfig
+import io.github.ultrapg.capturemonitor.model.TextureFilteringMode
 import io.github.ultrapg.capturemonitor.model.VideoMode
 import java.nio.ByteBuffer
 import java.nio.ByteOrder
@@ -32,14 +33,15 @@ import kotlin.math.min
  *
  * Features:
  * - Zero-copy `GL_TEXTURE_EXTERNAL_OES` direct DMA surface target for Camera2 / UVC hardware decoders
- * - GPU Contrast-Adaptive Sharpening (CAS), Brightness/Contrast/Saturation, Full/Limited RGB range expansion,
- *   Rec.709 / Rec.601 color matrix grading, and hardware transforms (Rotate, Mirror, Flip, Zoom, Aspect Ratio)
- * - Built-in 60/120Hz procedural broadcast SMPTE + motion sweep shader when testing or in Reference Signal mode
+ * - Default Fullscreen Stretch / Crop-to-Fill / Aspect Ratio scaling
+ * - GPU Contrast-Adaptive Sharpening (CAS), Brightness/Contrast/Saturation/Gamma, Full/Limited RGB range expansion,
+ *   Rec.709 / Rec.601 / sRGB / DCI-P3 color grading, Overscan crop, and Nearest-Neighbor vs Bilinear filtering
+ * - Clean dark obsidian canvas when no capture card is connected (with optional toggleable calibration test pattern)
  */
 class HardwareVideoRenderer(
     private val context: Context,
     private val glSurfaceView: GLSurfaceView,
-    private val onTelemetryTick: (fps: Float, frameTimeMs: Float) -> Unit
+    private val onTelemetryTick: (fps: Float, frameTimeMs: Float, isReceivingLiveFrames: Boolean) -> Unit
 ) : GLSurfaceView.Renderer, SurfaceTexture.OnFrameAvailableListener {
 
     companion object {
@@ -48,18 +50,21 @@ class HardwareVideoRenderer(
         private const val VERTEX_SHADER = """
             uniform mat4 uMVPMatrix;
             uniform mat4 uTexMatrix;
+            uniform float uOverscanCrop;
             attribute vec4 aPosition;
             attribute vec4 aTextureCoord;
             varying vec2 vTexCoord;
             varying vec2 vRawUv;
             void main() {
                 gl_Position = uMVPMatrix * aPosition;
-                vTexCoord = (uTexMatrix * aTextureCoord).xy;
+                // Apply optional overscan crop around center (0.5, 0.5)
+                vec2 croppedUv = (aTextureCoord.xy - 0.5) * (1.0 - uOverscanCrop) + 0.5;
+                vTexCoord = (uTexMatrix * vec4(croppedUv, 0.0, 1.0)).xy;
                 vRawUv = aTextureCoord.xy;
             }
         """
 
-        // External OES Fragment Shader with CAS sharpening, Color Space grading, Full/Limited range, and Safe Area Grid
+        // External OES Fragment Shader with CAS sharpening, Gamma, Color Space grading, Full/Limited range, and Safe Area Grid
         private const val FRAGMENT_SHADER_OES = """
             #extension GL_OES_EGL_image_external : require
             precision highp float;
@@ -70,6 +75,7 @@ class HardwareVideoRenderer(
             uniform float uBrightness;
             uniform float uContrast;
             uniform float uSaturation;
+            uniform float uGamma;
             uniform float uSharpness;
             uniform int uFullRange;
             uniform int uColorSpace;
@@ -81,7 +87,11 @@ class HardwareVideoRenderer(
                     c = clamp((c - vec3(0.062745)) * 1.164383, 0.0, 1.0);
                 }
                 // Contrast & Brightness
-                c = (c - 0.5) * uContrast + 0.5 + uBrightness;
+                c = clamp((c - 0.5) * uContrast + 0.5 + uBrightness, 0.0, 1.0);
+                // Gamma correction
+                if (abs(uGamma - 1.0) > 0.01) {
+                    c = pow(c, vec3(1.0 / max(uGamma, 0.2)));
+                }
                 // Luma coefficients: Rec.709 vs Rec.601
                 vec3 lumaWeights = (uColorSpace == 1)
                     ? vec3(0.299, 0.587, 0.114)
@@ -103,7 +113,6 @@ class HardwareVideoRenderer(
                 }
                 vec3 graded = applyColorGrade(center);
                 if (uShowGrid == 1) {
-                    // Rule of thirds + 90% broadcast title safe area
                     bool thirdsX = abs(vRawUv.x - 0.3333) < 0.0018 || abs(vRawUv.x - 0.6667) < 0.0018;
                     bool thirdsY = abs(vRawUv.y - 0.3333) < 0.0028 || abs(vRawUv.y - 0.6667) < 0.0028;
                     bool safeBorder = (
@@ -121,7 +130,7 @@ class HardwareVideoRenderer(
             }
         """
 
-        // Procedural Hardware Reference Pattern Shader (SMPTE Studio Color Bars + 60/120Hz Motion Sync Bar + Luma Ramp)
+        // Optional Calibration Test Pattern Shader (only drawn when user enables calibration pattern in settings)
         private const val FRAGMENT_SHADER_SYNTHETIC = """
             precision highp float;
             varying vec2 vRawUv;
@@ -129,6 +138,7 @@ class HardwareVideoRenderer(
             uniform float uBrightness;
             uniform float uContrast;
             uniform float uSaturation;
+            uniform float uGamma;
             uniform int uFullRange;
             uniform int uColorSpace;
             uniform int uShowGrid;
@@ -137,7 +147,10 @@ class HardwareVideoRenderer(
                 if (uFullRange == 0) {
                     c = clamp((c - vec3(0.062745)) * 1.164383, 0.0, 1.0);
                 }
-                c = (c - 0.5) * uContrast + 0.5 + uBrightness;
+                c = clamp((c - 0.5) * uContrast + 0.5 + uBrightness, 0.0, 1.0);
+                if (abs(uGamma - 1.0) > 0.01) {
+                    c = pow(c, vec3(1.0 / max(uGamma, 0.2)));
+                }
                 vec3 lumaWeights = (uColorSpace == 1)
                     ? vec3(0.299, 0.587, 0.114)
                     : vec3(0.2126, 0.7152, 0.0722);
@@ -151,20 +164,17 @@ class HardwareVideoRenderer(
                 vec3 col = vec3(0.05);
 
                 if (uv.y < 0.64) {
-                    // Top 64%: 75% SMPTE RP 219 High-Definition Color Bars
                     float idx = floor(uv.x * 7.0);
-                    if (idx < 1.0) col = vec3(0.75, 0.75, 0.75);       // 75% White
-                    else if (idx < 2.0) col = vec3(0.75, 0.75, 0.0);   // Yellow
-                    else if (idx < 3.0) col = vec3(0.0, 0.75, 0.75);   // Cyan
-                    else if (idx < 4.0) col = vec3(0.0, 0.75, 0.0);    // Green
-                    else if (idx < 5.0) col = vec3(0.75, 0.0, 0.75);   // Magenta
-                    else if (idx < 6.0) col = vec3(0.75, 0.0, 0.0);    // Red
-                    else col = vec3(0.0, 0.0, 0.75);                   // Blue
+                    if (idx < 1.0) col = vec3(0.75, 0.75, 0.75);
+                    else if (idx < 2.0) col = vec3(0.75, 0.75, 0.0);
+                    else if (idx < 3.0) col = vec3(0.0, 0.75, 0.75);
+                    else if (idx < 4.0) col = vec3(0.0, 0.75, 0.0);
+                    else if (idx < 5.0) col = vec3(0.75, 0.0, 0.75);
+                    else if (idx < 6.0) col = vec3(0.75, 0.0, 0.0);
+                    else col = vec3(0.0, 0.0, 0.75);
                 } else if (uv.y < 0.74) {
-                    // Continuous 16-bit Luma & Chroma Calibration Ramp
                     col = vec3(uv.x);
                 } else if (uv.y < 0.86) {
-                    // High-Refresh Latency & Judder Test Pendulum Bar
                     float sweep = fract(uTime * 0.45);
                     float dist = abs(uv.x - sweep);
                     float grid = step(0.985, fract(uv.x * 32.0));
@@ -175,7 +185,6 @@ class HardwareVideoRenderer(
                         col = mix(vec3(0.22, 0.88, 0.98), col, (dist - 0.012) / 0.023);
                     }
                 } else {
-                    // Bottom PLUGE Super-Black / Reference Black / 100% Peak White
                     if (uv.x < 0.25) col = vec3(0.02);
                     else if (uv.x < 0.50) col = vec3(0.0);
                     else if (uv.x < 0.75) col = vec3(1.0);
@@ -199,7 +208,6 @@ class HardwareVideoRenderer(
         .order(ByteOrder.nativeOrder())
         .asFloatBuffer()
         .apply {
-            // X, Y, U, V
             put(
                 floatArrayOf(
                     -1f, -1f, 0f, 0f,
@@ -235,17 +243,18 @@ class HardwareVideoRenderer(
     @Volatile
     private var useLiveCameraStream = false
 
+    @Volatile
+    private var hasReceivedAnyCameraFrame = false
+
     private var viewportWidth = 1920
     private var viewportHeight = 1080
     private var startTimeNs = System.nanoTime()
 
-    // FPS & Frame-time telemetry counters
     private var frameCount = 0
     private var lastTelemetryTimeNs = System.nanoTime()
     private var lastFrameTimestampNs = System.nanoTime()
     private var smoothedFrameTimeMs = 16.6f
 
-    // Camera2 background thread & state for UVC External / Camera capture
     private var cameraThread: HandlerThread? = null
     private var cameraHandler: Handler? = null
     private var openedCamera: CameraDevice? = null
@@ -270,12 +279,13 @@ class HardwareVideoRenderer(
             }
         } else {
             useLiveCameraStream = false
+            hasReceivedAnyCameraFrame = false
             stopCamera2Stream()
         }
     }
 
     override fun onSurfaceCreated(gl: GL10?, config: EGLConfig?) {
-        GLES20.glClearColor(0f, 0f, 0f, 1f)
+        GLES20.glClearColor(0.02f, 0.03f, 0.05f, 1f)
         Matrix.setIdentityM(texMatrix, 0)
 
         oesProgram = createGlProgram(VERTEX_SHADER, FRAGMENT_SHADER_OES)
@@ -318,6 +328,7 @@ class HardwareVideoRenderer(
 
         if (frameAvailable) {
             frameAvailable = false
+            hasReceivedAnyCameraFrame = true
             try {
                 surfaceTexture?.updateTexImage()
                 surfaceTexture?.getTransformMatrix(texMatrix)
@@ -328,24 +339,23 @@ class HardwareVideoRenderer(
         val cfg = renderConfig
         computeMvpMatrix(cfg)
 
-        if (useLiveCameraStream && oesProgram != 0) {
+        if (useLiveCameraStream && hasReceivedAnyCameraFrame && oesProgram != 0) {
             drawOesStream(cfg)
-        } else if (synthProgram != 0) {
+        } else if (cfg.showTestPatternWhenNoSignal && synthProgram != 0) {
             drawSyntheticReference(cfg, (nowNs - startTimeNs) / 1_000_000_000f)
         }
 
-        // Report FPS and frame time every ~450ms
         frameCount++
         val elapsedNs = nowNs - lastTelemetryTimeNs
         if (elapsedNs >= 450_000_000L) {
             val measuredFps = (frameCount * 1_000_000_000f) / elapsedNs.toFloat()
-            val reportedFps = if (useLiveCameraStream) {
-                measuredFps
-            } else {
-                // Reflect locked target refresh rate in reference generator mode
-                activeMode.fps.toFloat()
+            val live = useLiveCameraStream && hasReceivedAnyCameraFrame
+            val reportedFps = when {
+                live -> measuredFps
+                cfg.showTestPatternWhenNoSignal -> activeMode.fps.toFloat()
+                else -> 0f
             }
-            onTelemetryTick(reportedFps, smoothedFrameTimeMs)
+            onTelemetryTick(reportedFps, smoothedFrameTimeMs, live)
             frameCount = 0
             lastTelemetryTimeNs = nowNs
         }
@@ -359,29 +369,45 @@ class HardwareVideoRenderer(
     private fun computeMvpMatrix(cfg: RenderConfig) {
         Matrix.setIdentityM(mvpMatrix, 0)
 
-        // Aspect ratio scaling relative to viewport
         val viewAspect = viewportWidth.toFloat() / viewportHeight.toFloat()
         val targetAspect = when (cfg.aspectRatioPreset) {
-            AspectRatioPreset.NATIVE -> activeMode.width.toFloat() / activeMode.height.toFloat()
             AspectRatioPreset.STRETCH_FILL -> viewAspect
-            else -> cfg.aspectRatioPreset.ratio ?: (16f / 9f)
+            AspectRatioPreset.ZOOM_CROP -> activeMode.width.toFloat() / activeMode.height.toFloat()
+            AspectRatioPreset.NATIVE -> activeMode.width.toFloat() / activeMode.height.toFloat()
+            else -> cfg.aspectRatioPreset.ratio ?: viewAspect
         }
 
         var scaleX = 1f
         var scaleY = 1f
-        if (cfg.aspectRatioPreset != AspectRatioPreset.STRETCH_FILL) {
-            if (viewAspect > targetAspect) {
-                // Pillar-box left/right
-                scaleX = targetAspect / viewAspect
-            } else {
-                // Letter-box top/bottom
-                scaleY = viewAspect / targetAspect
+        when (cfg.aspectRatioPreset) {
+            AspectRatioPreset.STRETCH_FILL -> {
+                // Full screen edge-to-edge regardless of source aspect ratio
+                scaleX = 1f
+                scaleY = 1f
+            }
+            AspectRatioPreset.ZOOM_CROP -> {
+                // Fill entire screen while preserving aspect ratio (crops overflow)
+                if (viewAspect > targetAspect) {
+                    scaleY = viewAspect / targetAspect
+                } else {
+                    scaleX = targetAspect / viewAspect
+                }
+            }
+            else -> {
+                if (viewAspect > targetAspect) {
+                    scaleX = targetAspect / viewAspect
+                } else {
+                    scaleY = viewAspect / targetAspect
+                }
             }
         }
 
         scaleX *= cfg.zoomScale * (if (cfg.mirrorHorizontal) -1f else 1f)
         scaleY *= cfg.zoomScale * (if (cfg.flipVertical) -1f else 1f)
 
+        if (cfg.panX != 0f || cfg.panY != 0f) {
+            Matrix.translateM(mvpMatrix, 0, cfg.panX, cfg.panY, 0f)
+        }
         if (cfg.rotationDegrees != 0) {
             Matrix.rotateM(mvpMatrix, 0, cfg.rotationDegrees.toFloat(), 0f, 0f, 1f)
         }
@@ -406,6 +432,7 @@ class HardwareVideoRenderer(
 
         GLES20.glUniformMatrix4fv(mvpLoc, 1, false, mvpMatrix, 0)
         GLES20.glUniformMatrix4fv(texMatLoc, 1, false, texMatrix, 0)
+        GLES20.glUniform1f(GLES20.glGetUniformLocation(oesProgram, "uOverscanCrop"), cfg.overscanCropPercent.coerceIn(0f, 0.15f))
 
         GLES20.glUniform2f(
             GLES20.glGetUniformLocation(oesProgram, "uTexelSize"),
@@ -415,6 +442,7 @@ class HardwareVideoRenderer(
         GLES20.glUniform1f(GLES20.glGetUniformLocation(oesProgram, "uBrightness"), cfg.brightness)
         GLES20.glUniform1f(GLES20.glGetUniformLocation(oesProgram, "uContrast"), cfg.contrast)
         GLES20.glUniform1f(GLES20.glGetUniformLocation(oesProgram, "uSaturation"), cfg.saturation)
+        GLES20.glUniform1f(GLES20.glGetUniformLocation(oesProgram, "uGamma"), cfg.gamma)
         GLES20.glUniform1f(GLES20.glGetUniformLocation(oesProgram, "uSharpness"), cfg.sharpness)
         GLES20.glUniform1i(GLES20.glGetUniformLocation(oesProgram, "uFullRange"), if (cfg.fullRangeRgb) 1 else 0)
         GLES20.glUniform1i(GLES20.glGetUniformLocation(oesProgram, "uColorSpace"), cfg.colorSpace.code)
@@ -422,6 +450,15 @@ class HardwareVideoRenderer(
 
         GLES20.glActiveTexture(GLES20.GL_TEXTURE0)
         GLES20.glBindTexture(GLES11Ext.GL_TEXTURE_EXTERNAL_OES, oesTextureId)
+
+        val filterParam = if (cfg.filteringMode == TextureFilteringMode.NEAREST_PIXEL) {
+            GLES20.GL_NEAREST.toFloat()
+        } else {
+            GLES20.GL_LINEAR.toFloat()
+        }
+        GLES20.glTexParameterf(GLES11Ext.GL_TEXTURE_EXTERNAL_OES, GLES20.GL_TEXTURE_MIN_FILTER, filterParam)
+        GLES20.glTexParameterf(GLES11Ext.GL_TEXTURE_EXTERNAL_OES, GLES20.GL_TEXTURE_MAG_FILTER, filterParam)
+
         GLES20.glDrawArrays(GLES20.GL_TRIANGLE_STRIP, 0, 4)
     }
 
@@ -443,11 +480,13 @@ class HardwareVideoRenderer(
 
         GLES20.glUniformMatrix4fv(mvpLoc, 1, false, mvpMatrix, 0)
         GLES20.glUniformMatrix4fv(texMatLoc, 1, false, texMatrix, 0)
+        GLES20.glUniform1f(GLES20.glGetUniformLocation(synthProgram, "uOverscanCrop"), cfg.overscanCropPercent.coerceIn(0f, 0.15f))
 
         GLES20.glUniform1f(GLES20.glGetUniformLocation(synthProgram, "uTime"), timeSec)
         GLES20.glUniform1f(GLES20.glGetUniformLocation(synthProgram, "uBrightness"), cfg.brightness)
         GLES20.glUniform1f(GLES20.glGetUniformLocation(synthProgram, "uContrast"), cfg.contrast)
         GLES20.glUniform1f(GLES20.glGetUniformLocation(synthProgram, "uSaturation"), cfg.saturation)
+        GLES20.glUniform1f(GLES20.glGetUniformLocation(synthProgram, "uGamma"), cfg.gamma)
         GLES20.glUniform1i(GLES20.glGetUniformLocation(synthProgram, "uFullRange"), if (cfg.fullRangeRgb) 1 else 0)
         GLES20.glUniform1i(GLES20.glGetUniformLocation(synthProgram, "uColorSpace"), cfg.colorSpace.code)
         GLES20.glUniform1i(GLES20.glGetUniformLocation(synthProgram, "uShowGrid"), if (cfg.showSafeAreaGrid) 1 else 0)
@@ -509,11 +548,13 @@ class HardwareVideoRenderer(
 
                 override fun onDisconnected(camera: CameraDevice) {
                     useLiveCameraStream = false
+                    hasReceivedAnyCameraFrame = false
                     camera.close()
                 }
 
                 override fun onError(camera: CameraDevice, error: Int) {
                     useLiveCameraStream = false
+                    hasReceivedAnyCameraFrame = false
                     camera.close()
                 }
             }, handler)

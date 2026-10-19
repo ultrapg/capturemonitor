@@ -4,6 +4,7 @@ import android.Manifest
 import android.content.pm.PackageManager
 import android.os.Build
 import android.os.Bundle
+import android.util.DisplayMetrics
 import android.view.WindowManager
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.setContent
@@ -14,9 +15,13 @@ import androidx.core.content.ContextCompat
 import androidx.core.view.WindowCompat
 import androidx.core.view.WindowInsetsCompat
 import androidx.core.view.WindowInsetsControllerCompat
+import io.github.ultrapg.capturemonitor.model.HostDisplayInfo
 import io.github.ultrapg.capturemonitor.ui.CaptureMonitorScreen
 import io.github.ultrapg.capturemonitor.ui.MonitorViewModel
 import io.github.ultrapg.capturemonitor.ui.theme.CaptureMonitorTheme
+import kotlin.math.max
+import kotlin.math.min
+import kotlin.math.roundToInt
 
 class MainActivity : ComponentActivity() {
 
@@ -33,7 +38,7 @@ class MainActivity : ComponentActivity() {
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         enableEdgeToEdge()
-        configureImmersiveLowLatencyWindow()
+        configureImmersiveLowLatencyWindowAndDetectDisplay()
         checkAndUpdatePermissions(autoPrompt = true)
 
         setContent {
@@ -48,7 +53,7 @@ class MainActivity : ComponentActivity() {
 
     override fun onResume() {
         super.onResume()
-        configureImmersiveLowLatencyWindow()
+        configureImmersiveLowLatencyWindowAndDetectDisplay()
         checkAndUpdatePermissions(autoPrompt = false)
     }
 
@@ -74,7 +79,7 @@ class MainActivity : ComponentActivity() {
         )
     }
 
-    private fun configureImmersiveLowLatencyWindow() {
+    private fun configureImmersiveLowLatencyWindowAndDetectDisplay() {
         window.addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
 
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.P) {
@@ -84,14 +89,51 @@ class MainActivity : ComponentActivity() {
             }
         }
 
-        // Request highest supported display refresh rate (e.g., 90Hz / 120Hz / 144Hz on tablets & phones)
+        // Query highest physical resolution and refresh rate supported by the Android device display
+        var bestWidth = 1920
+        var bestHeight = 1080
+        var maxHz = 60
+        val rates = mutableSetOf(60)
+
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
-            display?.supportedModes?.maxByOrNull { it.refreshRate }?.let { bestMode ->
-                window.attributes = window.attributes.apply {
-                    preferredDisplayModeId = bestMode.modeId
+            val modes = display?.supportedModes
+            if (!modes.isNullOrEmpty()) {
+                modes.forEach { m -> rates.add(m.refreshRate.roundToInt()) }
+                val bestMode = modes.maxWithOrNull(
+                    compareBy<android.view.Display.Mode> { it.refreshRate.roundToInt() }
+                        .thenBy { it.physicalWidth.toLong() * it.physicalHeight.toLong() }
+                )
+                if (bestMode != null) {
+                    window.attributes = window.attributes.apply {
+                        preferredDisplayModeId = bestMode.modeId
+                        preferredRefreshRate = bestMode.refreshRate
+                    }
+                    bestWidth = max(bestMode.physicalWidth, bestMode.physicalHeight)
+                    bestHeight = min(bestMode.physicalWidth, bestMode.physicalHeight)
+                    maxHz = bestMode.refreshRate.roundToInt().coerceAtLeast(60)
                 }
             }
+        } else {
+            @Suppress("DEPRECATION")
+            val d = windowManager.defaultDisplay
+            val dm = DisplayMetrics()
+            @Suppress("DEPRECATION")
+            d.getRealMetrics(dm)
+            bestWidth = max(dm.widthPixels, dm.heightPixels)
+            bestHeight = min(dm.widthPixels, dm.heightPixels)
+            @Suppress("DEPRECATION")
+            maxHz = d.refreshRate.roundToInt().coerceAtLeast(60)
+            rates.add(maxHz)
         }
+
+        viewModel.onHostDisplayDetected(
+            HostDisplayInfo(
+                physicalWidth = bestWidth,
+                physicalHeight = bestHeight,
+                maxRefreshRateHz = maxHz,
+                supportedRefreshRatesHz = rates.sortedDescending()
+            )
+        )
 
         WindowCompat.setDecorFitsSystemWindows(window, false)
         WindowInsetsControllerCompat(window, window.decorView).let { controller ->

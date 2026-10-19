@@ -1,6 +1,7 @@
 package io.github.ultrapg.capturemonitor.ui
 
 import android.opengl.GLSurfaceView
+import androidx.activity.compose.BackHandler
 import androidx.compose.animation.AnimatedVisibility
 import androidx.compose.animation.core.tween
 import androidx.compose.animation.fadeIn
@@ -28,18 +29,25 @@ import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.width
+import androidx.compose.foundation.layout.widthIn
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
+import androidx.compose.foundation.text.KeyboardOptions
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.automirrored.filled.RotateRight
+import androidx.compose.material.icons.automirrored.filled.VolumeOff
+import androidx.compose.material.icons.automirrored.filled.VolumeUp
+import androidx.compose.material.icons.filled.Add
 import androidx.compose.material.icons.filled.Bolt
-import androidx.compose.material.icons.filled.ChevronLeft
+import androidx.compose.material.icons.filled.CheckCircle
 import androidx.compose.material.icons.filled.ChevronRight
 import androidx.compose.material.icons.filled.Close
 import androidx.compose.material.icons.filled.CropFree
 import androidx.compose.material.icons.filled.DeveloperBoard
 import androidx.compose.material.icons.filled.Flip
+import androidx.compose.material.icons.filled.Fullscreen
 import androidx.compose.material.icons.filled.GridOn
 import androidx.compose.material.icons.filled.Hd
 import androidx.compose.material.icons.filled.HighQuality
@@ -47,22 +55,20 @@ import androidx.compose.material.icons.filled.Info
 import androidx.compose.material.icons.filled.Memory
 import androidx.compose.material.icons.filled.Refresh
 import androidx.compose.material.icons.filled.RestartAlt
-import androidx.compose.material.icons.filled.RotateRight
 import androidx.compose.material.icons.filled.SettingsInputHdmi
 import androidx.compose.material.icons.filled.Speed
 import androidx.compose.material.icons.filled.Tune
 import androidx.compose.material.icons.filled.Usb
-import androidx.compose.material.icons.filled.Visibility
+import androidx.compose.material.icons.filled.UsbOff
 import androidx.compose.material.icons.filled.VisibilityOff
-import androidx.compose.material.icons.filled.VolumeOff
-import androidx.compose.material.icons.filled.VolumeUp
 import androidx.compose.material.icons.filled.WarningAmber
 import androidx.compose.material3.AssistChip
-import androidx.compose.material3.AssistChipDefaults
 import androidx.compose.material3.Button
 import androidx.compose.material3.ButtonDefaults
 import androidx.compose.material3.Card
 import androidx.compose.material3.CardDefaults
+import androidx.compose.material3.ElevatedCard
+import androidx.compose.material3.FilledTonalButton
 import androidx.compose.material3.FilterChip
 import androidx.compose.material3.FilterChipDefaults
 import androidx.compose.material3.HorizontalDivider
@@ -71,6 +77,7 @@ import androidx.compose.material3.IconButton
 import androidx.compose.material3.LinearProgressIndicator
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.OutlinedButton
+import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.Slider
 import androidx.compose.material3.Surface
 import androidx.compose.material3.Switch
@@ -92,9 +99,10 @@ import androidx.compose.ui.draw.clip
 import androidx.compose.ui.graphics.Brush
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.input.pointer.pointerInput
-import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.text.font.FontWeight
+import androidx.compose.ui.text.input.KeyboardType
+import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
@@ -104,6 +112,7 @@ import io.github.ultrapg.capturemonitor.model.AspectRatioPreset
 import io.github.ultrapg.capturemonitor.model.CaptureCardVendor
 import io.github.ultrapg.capturemonitor.model.CaptureDeviceInfo
 import io.github.ultrapg.capturemonitor.model.ColorSpaceMode
+import io.github.ultrapg.capturemonitor.model.TextureFilteringMode
 import io.github.ultrapg.capturemonitor.model.UsbStandard
 import io.github.ultrapg.capturemonitor.model.VideoFormat
 import io.github.ultrapg.capturemonitor.ui.theme.StudioAmber
@@ -111,6 +120,7 @@ import io.github.ultrapg.capturemonitor.ui.theme.StudioCyan
 import io.github.ultrapg.capturemonitor.ui.theme.StudioEmerald
 import io.github.ultrapg.capturemonitor.ui.theme.StudioIndigo
 import io.github.ultrapg.capturemonitor.ui.theme.StudioRose
+import io.github.ultrapg.capturemonitor.usb.UsbCaptureDiscovery
 import java.util.Locale
 
 @Composable
@@ -119,10 +129,14 @@ fun CaptureMonitorScreen(
     onRequestPermissions: () -> Unit
 ) {
     val state by viewModel.uiState.collectAsState()
-    val context = LocalContext.current
     var rendererRef by remember { mutableStateOf<HardwareVideoRenderer?>(null) }
 
-    // Sync renderer configuration whenever state changes
+    // Pressing the Back button or system back gesture toggles the Monitor Control Menu
+    // (just like Steam Link / Moonlight / Noir / console streaming apps)
+    BackHandler(enabled = true) {
+        viewModel.togglePanel()
+    }
+
     LaunchedEffect(state.renderConfig) {
         rendererRef?.updateRenderConfig(state.renderConfig)
     }
@@ -144,8 +158,8 @@ fun CaptureMonitorScreen(
     Box(
         modifier = Modifier
             .fillMaxSize()
-            .background(Color.Black)
-            // Support pinch-to-zoom, double-tap to toggle side panel, and swipe from right/left edge
+            .background(Color(0xFF05070B))
+            // Tap or double-tap gestures
             .pointerInput(state.isPanelOpen) {
                 detectTapGestures(
                     onDoubleTap = { viewModel.togglePanel() },
@@ -156,33 +170,63 @@ fun CaptureMonitorScreen(
                     }
                 )
             }
-            .pointerInput(Unit) {
+            // Swipe from either side edge (or horizontal swipe) to open/close the control drawer
+            .pointerInput(state.isPanelOpen) {
+                var startX = 0f
                 var accumulatedDragX = 0f
                 detectHorizontalDragGestures(
-                    onDragStart = { accumulatedDragX = 0f },
+                    onDragStart = { offset ->
+                        startX = offset.x
+                        accumulatedDragX = 0f
+                    },
                     onHorizontalDrag = { _, dragAmount ->
                         accumulatedDragX += dragAmount
-                        if (accumulatedDragX < -48f && !state.isPanelOpen) {
-                            viewModel.setPanelOpen(true)
-                            accumulatedDragX = 0f
-                        } else if (accumulatedDragX > 48f && state.isPanelOpen) {
-                            viewModel.setPanelOpen(false)
-                            accumulatedDragX = 0f
+                        val screenW = size.width.toFloat()
+                        val startedNearLeftEdge = startX <= screenW * 0.18f
+                        val startedNearRightEdge = startX >= screenW * 0.82f
+
+                        if (!state.isPanelOpen) {
+                            // Swipe inward from right edge OR swipe inward from left edge opens the menu
+                            if ((startedNearRightEdge && accumulatedDragX < -36f) ||
+                                (startedNearLeftEdge && accumulatedDragX > 36f) ||
+                                accumulatedDragX < -75f
+                            ) {
+                                viewModel.setPanelOpen(true)
+                                accumulatedDragX = 0f
+                            }
+                        } else {
+                            if (accumulatedDragX > 42f) {
+                                viewModel.setPanelOpen(false)
+                                accumulatedDragX = 0f
+                            }
                         }
                     }
                 )
             }
+            // Pinch-to-zoom and 2-finger pan
             .pointerInput(Unit) {
-                detectTransformGestures { _, _, zoom, _ ->
-                    if (zoom != 1f) {
+                detectTransformGestures { _, pan, zoom, _ ->
+                    if (zoom != 1f || pan.x != 0f || pan.y != 0f) {
                         viewModel.updateRenderConfig { cfg ->
-                            cfg.copy(zoomScale = (cfg.zoomScale * zoom).coerceIn(0.5f, 3.0f))
+                            val newZoom = (cfg.zoomScale * zoom).coerceIn(0.5f, 3.0f)
+                            val newPanX = if (newZoom > 1.01f) {
+                                (cfg.panX + pan.x / size.width.coerceAtLeast(1) * 2f).coerceIn(-1f, 1f)
+                            } else {
+                                0f
+                            }
+                            val newPanY = if (newZoom > 1.01f) {
+                                (cfg.panY - pan.y / size.height.coerceAtLeast(1) * 2f).coerceIn(-1f, 1f)
+                            } else {
+                                0f
+                            }
+                            cfg.copy(zoomScale = newZoom, panX = newPanX, panY = newPanY)
                         }
                     }
                 }
             }
     ) {
-        // 1. Fullscreen Hardware-Accelerated OpenGL ES 2.0/3.0 Zero-Copy Monitor Viewport
+        // 1. 100% Fullscreen Edge-to-Edge OpenGL ES 2.0/3.0 Zero-Copy Viewport
+        // No floating pills or HUD elements are rendered by default so 100% of the screen is utilized!
         AndroidView(
             modifier = Modifier.fillMaxSize(),
             factory = { ctx ->
@@ -192,8 +236,8 @@ fun CaptureMonitorScreen(
                     val renderer = HardwareVideoRenderer(
                         context = ctx,
                         glSurfaceView = this,
-                        onTelemetryTick = { fps, frameMs ->
-                            viewModel.onRendererTelemetry(fps, frameMs)
+                        onTelemetryTick = { fps, frameMs, isLive ->
+                            viewModel.onRendererTelemetry(fps, frameMs, isLive)
                         }
                     )
                     renderer.updateRenderConfig(state.renderConfig)
@@ -209,7 +253,27 @@ fun CaptureMonitorScreen(
             }
         )
 
-        // 2. Top-Left Compact Live Telemetry & Signal HUD Overlay (Can be hidden for pure clean monitor usage)
+        // 2. Minimalistic Material Design 3 "No Signal" Empty State
+        // Shown ONLY when no physical capture card is connected and calibration test pattern is off.
+        val showMinimalNoSignal = !state.isCaptureCardConnected &&
+            !state.isReceivingLiveFrames &&
+            !state.renderConfig.showTestPatternWhenNoSignal
+
+        AnimatedVisibility(
+            visible = showMinimalNoSignal,
+            enter = fadeIn(tween(250)),
+            exit = fadeOut(tween(200)),
+            modifier = Modifier.align(Alignment.Center)
+        ) {
+            MinimalNoSignalM3State(
+                hostDisplayLabel = state.hostDisplay.label,
+                selectedModeLabel = "${state.selectedMode.resolutionLabel} @ ${state.selectedMode.fps}Hz",
+                onOpenMenu = { viewModel.setPanelOpen(true) },
+                onRescanUsb = { viewModel.refreshDevices() }
+            )
+        }
+
+        // 3. Optional Top-Left Live Signal Telemetry HUD (Hidden by default; user can enable in settings)
         AnimatedVisibility(
             visible = state.showHudOverlay,
             enter = fadeIn(tween(200)),
@@ -225,81 +289,15 @@ fun CaptureMonitorScreen(
             )
         }
 
-        // Minimal floating HUD restore button when HUD & Panel are both hidden
-        AnimatedVisibility(
-            visible = !state.showHudOverlay && !state.isPanelOpen,
-            enter = fadeIn(),
-            exit = fadeOut(),
-            modifier = Modifier
-                .align(Alignment.TopStart)
-                .padding(10.dp)
-        ) {
-            Surface(
-                color = Color(0x660B0F19),
-                shape = CircleShape,
-                modifier = Modifier.clickable { viewModel.setShowHudOverlay(true) }
-            ) {
-                Row(
-                    verticalAlignment = Alignment.CenterVertically,
-                    modifier = Modifier.padding(horizontal = 10.dp, vertical = 6.dp)
-                ) {
-                    Icon(
-                        imageVector = Icons.Default.Visibility,
-                        contentDescription = "Show HUD",
-                        tint = Color.White.copy(alpha = 0.75f),
-                        modifier = Modifier.size(15.dp)
-                    )
-                    Spacer(Modifier.width(4.dp))
-                    Text(
-                        text = "HUD",
-                        fontSize = 11.sp,
-                        color = Color.White.copy(alpha = 0.75f),
-                        fontFamily = FontFamily.Monospace
-                    )
-                }
-            }
-        }
-
-        // 3. Right-Edge Subtle Swipe Handle Pill (Always accessible to swipe or tap open the control drawer)
-        AnimatedVisibility(
-            visible = !state.isPanelOpen,
-            enter = fadeIn(),
-            exit = fadeOut(),
-            modifier = Modifier.align(Alignment.CenterEnd)
-        ) {
-            Box(
-                contentAlignment = Alignment.Center,
-                modifier = Modifier
-                    .padding(end = 4.dp)
-                    .width(26.dp)
-                    .height(104.dp)
-                    .clip(RoundedCornerShape(topStart = 14.dp, bottomStart = 14.dp))
-                    .background(Color(0xAA0F172A))
-                    .border(
-                        width = 1.dp,
-                        color = StudioCyan.copy(alpha = 0.45f),
-                        shape = RoundedCornerShape(topStart = 14.dp, bottomStart = 14.dp)
-                    )
-                    .clickable { viewModel.setPanelOpen(true) }
-            ) {
-                Icon(
-                    imageVector = Icons.Default.ChevronLeft,
-                    contentDescription = "Open Monitor Drawer",
-                    tint = StudioCyan,
-                    modifier = Modifier.size(20.dp)
-                )
-            }
-        }
-
-        // 4. Bottom Status / Negotiation Toast Banner (when USB port warning or UVC commit occurs)
+        // 4. Bottom Status / Negotiation Toast Banner (Only visible while the menu drawer is open)
         val banner = state.bannerMessage
         AnimatedVisibility(
-            visible = banner != null,
+            visible = banner != null && state.isPanelOpen,
             enter = fadeIn(),
             exit = fadeOut(),
             modifier = Modifier
                 .align(Alignment.BottomStart)
-                .padding(start = 16.dp, bottom = 14.dp, end = if (state.isPanelOpen) 410.dp else 16.dp)
+                .padding(start = 16.dp, bottom = 14.dp, end = 430.dp)
         ) {
             if (banner != null) {
                 Surface(
@@ -352,11 +350,12 @@ fun CaptureMonitorScreen(
             }
         }
 
-        // 5. Slide-Over Material Design 3 Control Drawer (Swipe from right edge or tap handle)
+        // 5. Slide-Over Material Design 3 Control Drawer
+        // Hidden by default; triggered by swiping from either screen edge, pressing Back, or double-tapping
         AnimatedVisibility(
             visible = state.isPanelOpen,
-            enter = slideInHorizontally(initialOffsetX = { it }, animationSpec = tween(260)) + fadeIn(),
-            exit = slideOutHorizontally(targetOffsetX = { it }, animationSpec = tween(220)) + fadeOut(),
+            enter = slideInHorizontally(initialOffsetX = { it }, animationSpec = tween(240)) + fadeIn(),
+            exit = slideOutHorizontally(targetOffsetX = { it }, animationSpec = tween(200)) + fadeOut(),
             modifier = Modifier.align(Alignment.CenterEnd)
         ) {
             SlideOverMonitorControlPanel(
@@ -364,6 +363,107 @@ fun CaptureMonitorScreen(
                 viewModel = viewModel,
                 onRequestPermissions = onRequestPermissions
             )
+        }
+    }
+}
+
+/**
+ * Clean, minimalistic Material Design 3 "No Signal" card shown when no capture card is connected.
+ */
+@Composable
+private fun MinimalNoSignalM3State(
+    hostDisplayLabel: String,
+    selectedModeLabel: String,
+    onOpenMenu: () -> Unit,
+    onRescanUsb: () -> Unit
+) {
+    ElevatedCard(
+        shape = RoundedCornerShape(28.dp),
+        colors = CardDefaults.elevatedCardColors(
+            containerColor = Color(0xFF0F172A).copy(alpha = 0.92f)
+        ),
+        modifier = Modifier
+            .widthIn(max = 380.dp)
+            .padding(24.dp)
+    ) {
+        Column(
+            horizontalAlignment = Alignment.CenterHorizontally,
+            modifier = Modifier.padding(horizontal = 28.dp, vertical = 26.dp)
+        ) {
+            Surface(
+                shape = CircleShape,
+                color = MaterialTheme.colorScheme.primaryContainer.copy(alpha = 0.45f),
+                modifier = Modifier.size(56.dp)
+            ) {
+                Box(contentAlignment = Alignment.Center) {
+                    Icon(
+                        imageVector = Icons.Default.SettingsInputHdmi,
+                        contentDescription = null,
+                        tint = StudioCyan,
+                        modifier = Modifier.size(28.dp)
+                    )
+                }
+            }
+
+            Spacer(Modifier.height(16.dp))
+
+            Text(
+                text = "No Signal",
+                style = MaterialTheme.typography.titleLarge,
+                color = Color.White
+            )
+
+            Spacer(Modifier.height(6.dp))
+
+            Text(
+                text = "Connect a USB-C or USB HDMI capture card.\nSwipe from edge or press Back for settings.",
+                style = MaterialTheme.typography.bodyMedium,
+                color = Color(0xFF94A3B8),
+                textAlign = TextAlign.Center
+            )
+
+            Spacer(Modifier.height(14.dp))
+
+            Surface(
+                color = Color(0xFF1E293B).copy(alpha = 0.7f),
+                shape = RoundedCornerShape(10.dp)
+            ) {
+                Text(
+                    text = "Display: $hostDisplayLabel • Target: $selectedModeLabel",
+                    fontSize = 11.sp,
+                    fontFamily = FontFamily.Monospace,
+                    color = StudioCyan,
+                    modifier = Modifier.padding(horizontal = 10.dp, vertical = 5.dp)
+                )
+            }
+
+            Spacer(Modifier.height(18.dp))
+
+            Row(
+                horizontalArrangement = Arrangement.spacedBy(10.dp)
+            ) {
+                FilledTonalButton(
+                    onClick = onRescanUsb,
+                    shape = RoundedCornerShape(14.dp)
+                ) {
+                    Icon(Icons.Default.Refresh, contentDescription = null, modifier = Modifier.size(16.dp))
+                    Spacer(Modifier.width(6.dp))
+                    Text("Scan USB", fontSize = 12.sp)
+                }
+
+                Button(
+                    onClick = onOpenMenu,
+                    shape = RoundedCornerShape(14.dp),
+                    colors = ButtonDefaults.buttonColors(
+                        containerColor = StudioCyan,
+                        contentColor = Color(0xFF041E2B)
+                    )
+                ) {
+                    Icon(Icons.Default.Tune, contentDescription = null, modifier = Modifier.size(16.dp))
+                    Spacer(Modifier.width(6.dp))
+                    Text("Settings", fontSize = 12.sp, fontWeight = FontWeight.SemiBold)
+                }
+            }
         }
     }
 }
@@ -378,6 +478,7 @@ private fun TopSignalTelemetryHud(
     val mode = state.selectedMode
     val usbStd = state.effectiveUsbStandard
     val isExceeding = state.isModeExceedingUsbPort
+    val connected = state.isCaptureCardConnected
 
     Surface(
         color = Color(0xCC0B0F19),
@@ -385,9 +486,10 @@ private fun TopSignalTelemetryHud(
         border = androidx.compose.foundation.BorderStroke(
             width = 1.dp,
             color = when {
+                !connected -> Color.White.copy(alpha = 0.14f)
                 isExceeding && !state.forceBypassUsbLimits -> StudioAmber.copy(alpha = 0.8f)
                 state.forceBypassUsbLimits && isExceeding -> StudioRose.copy(alpha = 0.8f)
-                else -> Color.White.copy(alpha = 0.14f)
+                else -> StudioEmerald.copy(alpha = 0.6f)
             }
         )
     ) {
@@ -395,13 +497,13 @@ private fun TopSignalTelemetryHud(
             verticalAlignment = Alignment.CenterVertically,
             modifier = Modifier.padding(horizontal = 12.dp, vertical = 8.dp)
         ) {
-            // Live Status Pulse Dot
             Box(
                 modifier = Modifier
                     .size(9.dp)
                     .clip(CircleShape)
                     .background(
                         when {
+                            !connected -> Color(0xFF64748B)
                             isExceeding && !state.forceBypassUsbLimits -> StudioAmber
                             state.forceBypassUsbLimits && isExceeding -> StudioRose
                             else -> StudioEmerald
@@ -413,7 +515,7 @@ private fun TopSignalTelemetryHud(
             Column {
                 Row(verticalAlignment = Alignment.CenterVertically) {
                     Text(
-                        text = dev?.name ?: "No USB Capture Card",
+                        text = if (connected) (dev?.name ?: "USB Capture Card") else "No Capture Card Connected",
                         color = Color.White,
                         fontWeight = FontWeight.SemiBold,
                         fontSize = 12.sp,
@@ -454,16 +556,6 @@ private fun TopSignalTelemetryHud(
                         fontSize = 11.sp,
                         fontFamily = FontFamily.Monospace
                     )
-                    if (state.forceBypassUsbLimits && isExceeding) {
-                        Spacer(Modifier.width(6.dp))
-                        Text(
-                            text = "[FORCED OVERRIDE]",
-                            color = StudioRose,
-                            fontSize = 10.sp,
-                            fontFamily = FontFamily.Monospace,
-                            fontWeight = FontWeight.Bold
-                        )
-                    }
                 }
             }
 
@@ -494,7 +586,6 @@ private fun TopSignalTelemetryHud(
     }
 }
 
-@OptIn(ExperimentalLayoutApi::class)
 @Composable
 private fun SlideOverMonitorControlPanel(
     state: MonitorUiState,
@@ -502,19 +593,19 @@ private fun SlideOverMonitorControlPanel(
     onRequestPermissions: () -> Unit
 ) {
     var selectedTab by remember { mutableIntStateOf(0) }
-    val tabs = listOf("Signal & USB", "GPU & Aspect", "Audio & HUD")
+    val tabs = listOf("Signal & Custom Res", "Fullscreen & GPU", "Audio & HUD")
 
     Surface(
-        color = Color(0xF20B0F19),
+        color = Color(0xF50B0F19),
         modifier = Modifier
-            .width(396.dp)
+            .width(412.dp)
             .fillMaxHeight()
             .border(
                 width = 1.dp,
                 color = Color.White.copy(alpha = 0.12f),
-                shape = RoundedCornerShape(topStart = 20.dp, bottomStart = 20.dp)
+                shape = RoundedCornerShape(topStart = 22.dp, bottomStart = 22.dp)
             ),
-        shape = RoundedCornerShape(topStart = 20.dp, bottomStart = 20.dp)
+        shape = RoundedCornerShape(topStart = 22.dp, bottomStart = 22.dp)
     ) {
         Column(modifier = Modifier.fillMaxSize()) {
             // Drawer Header
@@ -538,12 +629,12 @@ private fun SlideOverMonitorControlPanel(
                 Spacer(Modifier.width(10.dp))
                 Column(modifier = Modifier.weight(1f)) {
                     Text(
-                        text = "CaptureMonitor Studio",
+                        text = "CaptureMonitor",
                         style = MaterialTheme.typography.titleMedium,
                         color = Color.White
                     )
                     Text(
-                        text = "Hardware-Accelerated USB/HDMI Display • v0.1.0",
+                        text = "Swipe edge or press Back to hide • v0.2.0",
                         fontSize = 11.sp,
                         color = Color(0xFF94A3B8)
                     )
@@ -577,7 +668,7 @@ private fun SlideOverMonitorControlPanel(
                         text = {
                             Text(
                                 text = title,
-                                fontSize = 12.sp,
+                                fontSize = 11.sp,
                                 fontWeight = if (selectedTab == index) FontWeight.Bold else FontWeight.Medium
                             )
                         }
@@ -585,7 +676,6 @@ private fun SlideOverMonitorControlPanel(
                 }
             }
 
-            // Scrollable Tab Body
             Column(
                 modifier = Modifier
                     .fillMaxSize()
@@ -621,61 +711,142 @@ private fun SignalAndUsbTab(
     viewModel: MonitorViewModel,
     onRequestPermissions: () -> Unit
 ) {
-    // 1. Capture Card Source Selector (Magewell, Elgato, AVerMedia, MacroSilicon, Generic UVC)
+    // 1. Live Capture Card Hardware Recognition Status Card
     SectionCard(
-        title = "Capture Card & USB Source",
-        icon = Icons.Default.Usb
+        title = "USB Capture Card Hardware Status",
+        icon = if (state.isCaptureCardConnected) Icons.Default.Usb else Icons.Default.UsbOff
     ) {
-        state.devices.forEach { device ->
-            val isSelected = device.id == state.selectedDevice?.id
-            CaptureDeviceRow(
-                device = device,
-                isSelected = isSelected,
-                onClick = { viewModel.selectDevice(device) }
-            )
-            Spacer(Modifier.height(6.dp))
-        }
+        if (state.isCaptureCardConnected && state.devices.isNotEmpty()) {
+            Row(
+                verticalAlignment = Alignment.CenterVertically,
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .clip(RoundedCornerShape(8.dp))
+                    .background(StudioEmerald.copy(alpha = 0.14f))
+                    .padding(horizontal = 10.dp, vertical = 6.dp)
+            ) {
+                Icon(
+                    imageVector = Icons.Default.CheckCircle,
+                    contentDescription = null,
+                    tint = StudioEmerald,
+                    modifier = Modifier.size(16.dp)
+                )
+                Spacer(Modifier.width(8.dp))
+                Text(
+                    text = "${state.devices.size} Physical Capture Card(s) Detected on USB Bus",
+                    color = StudioEmerald,
+                    fontSize = 11.sp,
+                    fontWeight = FontWeight.SemiBold
+                )
+            }
+            Spacer(Modifier.height(8.dp))
 
-        if (!state.hasCameraPermission) {
-            Spacer(Modifier.height(4.dp))
-            OutlinedButton(
-                onClick = onRequestPermissions,
+            state.devices.forEach { device ->
+                val isSelected = device.id == state.selectedDevice?.id
+                CaptureDeviceRow(
+                    device = device,
+                    isSelected = isSelected,
+                    onClick = { viewModel.selectDevice(device) }
+                )
+                Spacer(Modifier.height(6.dp))
+            }
+
+            if (state.selectedDevice?.hasUsbPermission == false) {
+                Button(
+                    onClick = { viewModel.requestUsbPermissionForCurrentDevice() },
+                    modifier = Modifier.fillMaxWidth()
+                ) {
+                    Text("Authorize USB Capture Card Access", fontSize = 12.sp)
+                }
+            }
+        } else {
+            // Explicitly show that NO capture card is currently plugged in
+            Surface(
+                color = Color(0xFF0F172A),
+                shape = RoundedCornerShape(10.dp),
+                border = androidx.compose.foundation.BorderStroke(1.dp, Color.White.copy(alpha = 0.08f)),
                 modifier = Modifier.fillMaxWidth()
             ) {
-                Icon(Icons.Default.HighQuality, contentDescription = null, modifier = Modifier.size(16.dp))
-                Spacer(Modifier.width(8.dp))
-                Text("Grant UVC Camera & USB Audio Permission", fontSize = 12.sp)
+                Row(
+                    verticalAlignment = Alignment.CenterVertically,
+                    modifier = Modifier.padding(12.dp)
+                ) {
+                    Icon(
+                        imageVector = Icons.Default.UsbOff,
+                        contentDescription = null,
+                        tint = Color(0xFF94A3B8),
+                        modifier = Modifier.size(22.dp)
+                    )
+                    Spacer(Modifier.width(10.dp))
+                    Column(modifier = Modifier.weight(1f)) {
+                        Text(
+                            text = "No USB Capture Card Connected",
+                            color = Color.White,
+                            fontWeight = FontWeight.SemiBold,
+                            fontSize = 12.sp
+                        )
+                        Text(
+                            text = "Plug in a Magewell USB Capture HDMI or UVC card via USB-C / OTG. Audio loopback is automatically silenced while disconnected.",
+                            color = Color(0xFF94A3B8),
+                            fontSize = 11.sp
+                        )
+                    }
+                }
+            }
+        }
+
+        Spacer(Modifier.height(6.dp))
+        Row(
+            horizontalArrangement = Arrangement.spacedBy(8.dp),
+            modifier = Modifier.fillMaxWidth()
+        ) {
+            FilledTonalButton(
+                onClick = { viewModel.refreshDevices() },
+                modifier = Modifier.weight(1f)
+            ) {
+                Icon(Icons.Default.Refresh, contentDescription = null, modifier = Modifier.size(15.dp))
+                Spacer(Modifier.width(6.dp))
+                Text("Rescan USB", fontSize = 11.sp)
+            }
+            if (!state.hasCameraPermission || !state.hasAudioPermission) {
+                OutlinedButton(
+                    onClick = onRequestPermissions,
+                    modifier = Modifier.weight(1f)
+                ) {
+                    Icon(Icons.Default.HighQuality, contentDescription = null, modifier = Modifier.size(15.dp))
+                    Spacer(Modifier.width(6.dp))
+                    Text("Permissions", fontSize = 11.sp)
+                }
             }
         }
     }
 
-    // 2. USB Port Standard & Bandwidth Ceiling Analyzer + Force Override
-    UsbBandwidthAndForceCard(
+    // 2. Custom Resolution & Native Display Matcher Card
+    CustomResolutionBuilderCard(
         state = state,
         viewModel = viewModel
     )
 
-    // 3. Resolution Selector (All Qualities: 4K UHD down to 480p)
+    // 3. All Capture Card Resolutions (4K, Ultrawide 21:9, 16:10 Tablet, 1440p, 1080p, 720p, Retro 4:3, PAL/NTSC)
     SectionCard(
-        title = "Monitor Resolution",
+        title = "All Capture Card Resolutions",
         icon = Icons.Default.Hd
     ) {
-        val resolutions = listOf(
-            Triple(3840, 2160, "4K UHD (3840×2160)"),
-            Triple(2560, 1440, "1440p QHD (2560×1440)"),
-            Triple(1920, 1200, "1200p WUXGA (1920×1200)"),
-            Triple(1920, 1080, "1080p FHD (1920×1080)"),
-            Triple(1600, 900, "900p HD+ (1600×900)"),
-            Triple(1280, 720, "720p HD (1280×720)"),
-            Triple(720, 576, "576p PAL (720×576)"),
-            Triple(720, 480, "480p NTSC (720×480)"),
-            Triple(640, 480, "480p VGA (640×480)")
-        )
+        val allPresets = buildList {
+            state.customModes.forEach { custom ->
+                add(Triple(custom.width, custom.height, "Custom (${custom.width}×${custom.height})"))
+            }
+            UsbCaptureDiscovery.STANDARD_RESOLUTIONS.forEach { (w, h) ->
+                val modeObj = io.github.ultrapg.capturemonitor.model.VideoMode(w, h, 60)
+                add(Triple(w, h, "${modeObj.commonName} (${w}×${h})"))
+            }
+        }.distinctBy { it.first to it.second }
+
         FlowRow(
             horizontalArrangement = Arrangement.spacedBy(6.dp),
             verticalArrangement = Arrangement.spacedBy(6.dp)
         ) {
-            resolutions.forEach { (w, h, label) ->
+            allPresets.forEach { (w, h, label) ->
                 val selected = state.selectedMode.width == w && state.selectedMode.height == h
                 val candidateMbps = state.selectedMode.format.requiredBandwidthMbps(w, h, state.selectedMode.fps)
                 val exceedsPort = candidateMbps > state.effectiveUsbStandard.maxPracticalPayloadMbps
@@ -692,7 +863,7 @@ private fun SignalAndUsbTab(
                                     imageVector = Icons.Default.WarningAmber,
                                     contentDescription = "Exceeds USB Port Bandwidth",
                                     tint = StudioAmber,
-                                    modifier = Modifier.size(13.dp)
+                                    modifier = Modifier.size(12.dp)
                                 )
                             }
                         }
@@ -711,7 +882,18 @@ private fun SignalAndUsbTab(
         title = "Refresh Rate (Hz / FPS)",
         icon = Icons.Default.Speed
     ) {
-        val framerates = listOf(240, 144, 120, 60, 59, 50, 30, 25, 24)
+        Text(
+            text = "Device Screen Max Refresh: ${state.hostDisplay.maxRefreshRateHz}Hz (${state.hostDisplay.physicalWidth}×${state.hostDisplay.physicalHeight})",
+            color = StudioCyan,
+            fontSize = 11.sp,
+            fontFamily = FontFamily.Monospace
+        )
+        Spacer(Modifier.height(6.dp))
+
+        val framerates = (listOf(state.selectedMode.fps) + UsbCaptureDiscovery.STANDARD_REFRESH_RATES)
+            .distinct()
+            .sortedDescending()
+
         FlowRow(
             horizontalArrangement = Arrangement.spacedBy(6.dp),
             verticalArrangement = Arrangement.spacedBy(6.dp)
@@ -751,9 +933,15 @@ private fun SignalAndUsbTab(
         }
     }
 
-    // 5. Capture Pixel Format / Compression (MJPEG, Uncompressed YUY2 4:2:2, NV12 4:2:0, H.264)
+    // 5. USB Port Link Speed Analyzer & Force-Mode Engine
+    UsbBandwidthAndForceCard(
+        state = state,
+        viewModel = viewModel
+    )
+
+    // 6. Capture Pixel Format & Encoding
     SectionCard(
-        title = "Capture Pixel Format & Encoding",
+        title = "Capture Pixel Format & Chroma Subsampling",
         icon = Icons.Default.Memory
     ) {
         VideoFormat.entries.forEach { fmt ->
@@ -814,7 +1002,94 @@ private fun SignalAndUsbTab(
     }
 }
 
-@OptIn(ExperimentalLayoutApi::class)
+@Composable
+private fun CustomResolutionBuilderCard(
+    state: MonitorUiState,
+    viewModel: MonitorViewModel
+) {
+    var widthInput by remember(state.selectedMode.width) { mutableStateOf(state.selectedMode.width.toString()) }
+    var heightInput by remember(state.selectedMode.height) { mutableStateOf(state.selectedMode.height.toString()) }
+    var fpsInput by remember(state.selectedMode.fps) { mutableStateOf(state.selectedMode.fps.toString()) }
+
+    SectionCard(
+        title = "Custom Resolution & Native Screen Match",
+        icon = Icons.Default.Add
+    ) {
+        Text(
+            text = "Enter any custom resolution (320×240 up to 7680×4320) and refresh rate (1–240Hz) to negotiate or force on the capture card:",
+            color = Color(0xFF94A3B8),
+            fontSize = 11.sp
+        )
+        Spacer(Modifier.height(8.dp))
+
+        Row(
+            horizontalArrangement = Arrangement.spacedBy(8.dp),
+            verticalAlignment = Alignment.CenterVertically,
+            modifier = Modifier.fillMaxWidth()
+        ) {
+            OutlinedTextField(
+                value = widthInput,
+                onValueChange = { widthInput = it.filter { ch -> ch.isDigit() }.take(4) },
+                label = { Text("Width", fontSize = 10.sp) },
+                singleLine = true,
+                keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Number),
+                modifier = Modifier.weight(1f)
+            )
+            OutlinedTextField(
+                value = heightInput,
+                onValueChange = { heightInput = it.filter { ch -> ch.isDigit() }.take(4) },
+                label = { Text("Height", fontSize = 10.sp) },
+                singleLine = true,
+                keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Number),
+                modifier = Modifier.weight(1f)
+            )
+            OutlinedTextField(
+                value = fpsInput,
+                onValueChange = { fpsInput = it.filter { ch -> ch.isDigit() }.take(3) },
+                label = { Text("Hz / FPS", fontSize = 10.sp) },
+                singleLine = true,
+                keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Number),
+                modifier = Modifier.weight(0.85f)
+            )
+        }
+
+        Spacer(Modifier.height(8.dp))
+
+        Row(
+            horizontalArrangement = Arrangement.spacedBy(8.dp),
+            modifier = Modifier.fillMaxWidth()
+        ) {
+            Button(
+                onClick = {
+                    val w = widthInput.toIntOrNull()?.coerceIn(320, 7680) ?: 1920
+                    val h = heightInput.toIntOrNull()?.coerceIn(240, 4320) ?: 1080
+                    val hz = fpsInput.toIntOrNull()?.coerceIn(1, 240) ?: 60
+                    viewModel.selectResolutionAndFps(width = w, height = h, fps = hz, isCustom = true)
+                },
+                colors = ButtonDefaults.buttonColors(
+                    containerColor = StudioCyan,
+                    contentColor = Color(0xFF041E2B)
+                ),
+                modifier = Modifier.weight(1f)
+            ) {
+                Text("Apply Custom Mode", fontSize = 11.sp, fontWeight = FontWeight.Bold)
+            }
+
+            FilledTonalButton(
+                onClick = { viewModel.matchHostScreenResolutionAndHz() },
+                modifier = Modifier.weight(1f)
+            ) {
+                Icon(Icons.Default.Fullscreen, contentDescription = null, modifier = Modifier.size(15.dp))
+                Spacer(Modifier.width(4.dp))
+                Text(
+                    text = "Match Screen (${state.hostDisplay.maxRefreshRateHz}Hz)",
+                    fontSize = 11.sp
+                )
+            }
+        }
+    }
+}
+
 @Composable
 private fun UsbBandwidthAndForceCard(
     state: MonitorUiState,
@@ -831,7 +1106,6 @@ private fun UsbBandwidthAndForceCard(
         title = "USB Port Link Speed & Force-Mode Engine",
         icon = Icons.Default.Bolt
     ) {
-        // Detected or simulated USB port standard badge
         Row(
             verticalAlignment = Alignment.CenterVertically,
             horizontalArrangement = Arrangement.SpaceBetween,
@@ -870,7 +1144,7 @@ private fun UsbBandwidthAndForceCard(
 
         Spacer(Modifier.height(8.dp))
         Text(
-            text = "Test / Inspect USB Port Standard:",
+            text = "Inspect / Override USB Port Standard:",
             color = Color(0xFF94A3B8),
             fontSize = 11.sp
         )
@@ -885,7 +1159,12 @@ private fun UsbBandwidthAndForceCard(
                 onClick = { viewModel.setSimulatedUsbPortStandard(null) },
                 label = { Text("Auto Detect", fontSize = 10.sp) }
             )
-            listOf(UsbStandard.USB_2_0, UsbStandard.USB_3_0_GEN1, UsbStandard.USB_3_2_GEN2).forEach { std ->
+            listOf(
+                UsbStandard.USB_2_0,
+                UsbStandard.USB_3_0_GEN1,
+                UsbStandard.USB_3_2_GEN2,
+                UsbStandard.USB_4_GEN3
+            ).forEach { std ->
                 FilterChip(
                     selected = state.simulatedUsbPortStandard == std,
                     onClick = { viewModel.setSimulatedUsbPortStandard(std) },
@@ -894,7 +1173,6 @@ private fun UsbBandwidthAndForceCard(
             }
         }
 
-        // Bandwidth warning box when current mode exceeds USB port capability
         if (exceeds) {
             Spacer(Modifier.height(8.dp))
             Surface(
@@ -912,7 +1190,7 @@ private fun UsbBandwidthAndForceCard(
                         )
                         Spacer(Modifier.width(6.dp))
                         Text(
-                            text = "USB Port Bandwidth Bottleneck Detected",
+                            text = "USB Port Bandwidth Limit Warning",
                             color = StudioAmber,
                             fontWeight = FontWeight.Bold,
                             fontSize = 12.sp
@@ -920,7 +1198,7 @@ private fun UsbBandwidthAndForceCard(
                     }
                     Spacer(Modifier.height(4.dp))
                     Text(
-                        text = "${mode.resolutionLabel} @ ${mode.fps}Hz (${mode.format.shortName}) needs ~$requiredMbps Mbps, which exceeds ${usbStd.specName}'s practical limit ($ceilingMbps Mbps). You can either switch to MJPEG or force-negotiate the mode anyway.",
+                        text = "${mode.resolutionLabel} @ ${mode.fps}Hz (${mode.format.shortName}) requires ~$requiredMbps Mbps, exceeding ${usbStd.specName}'s $ceilingMbps Mbps limit. Switch to MJPEG or enable Force Mode below.",
                         color = Color(0xFFFDE68A),
                         fontSize = 11.sp
                     )
@@ -929,20 +1207,19 @@ private fun UsbBandwidthAndForceCard(
         }
 
         Spacer(Modifier.height(8.dp))
-        // Force Mode Switch + Direct UVC VS_COMMIT_CONTROL Trigger Button
         Row(
             verticalAlignment = Alignment.CenterVertically,
             modifier = Modifier.fillMaxWidth()
         ) {
             Column(modifier = Modifier.weight(1f)) {
                 Text(
-                    text = "Force Unsupported Resolution / FPS",
+                    text = "Force Unsupported Resolution / Refresh Rate",
                     color = Color.White,
                     fontWeight = FontWeight.SemiBold,
                     fontSize = 12.sp
                 )
                 Text(
-                    text = "Bypass USB speed checks & send raw UVC VS_COMMIT_CONTROL",
+                    text = "Bypass USB speed limits & send raw UVC VS_COMMIT_CONTROL",
                     color = Color(0xFF94A3B8),
                     fontSize = 11.sp
                 )
@@ -982,9 +1259,16 @@ private fun GpuAndAspectTab(
     val cfg = state.renderConfig
 
     SectionCard(
-        title = "Aspect Ratio & Geometry",
+        title = "Full Screen Scaling & Aspect Ratio",
         icon = Icons.Default.CropFree
     ) {
+        Text(
+            text = "Defaults to Full Screen (Stretch Fill) so the entire phone/tablet screen is always used edge-to-edge:",
+            color = Color(0xFF94A3B8),
+            fontSize = 11.sp
+        )
+        Spacer(Modifier.height(6.dp))
+
         FlowRow(
             horizontalArrangement = Arrangement.spacedBy(6.dp),
             verticalArrangement = Arrangement.spacedBy(6.dp)
@@ -1012,7 +1296,7 @@ private fun GpuAndAspectTab(
                     }
                 },
                 leadingIcon = {
-                    Icon(Icons.Default.RotateRight, contentDescription = null, modifier = Modifier.size(16.dp))
+                    Icon(Icons.AutoMirrored.Filled.RotateRight, contentDescription = null, modifier = Modifier.size(16.dp))
                 },
                 label = { Text("Rotate (${cfg.rotationDegrees}°)", fontSize = 11.sp) }
             )
@@ -1041,12 +1325,39 @@ private fun GpuAndAspectTab(
             valueRange = 0.5f..3.0f,
             onValueChange = { v -> viewModel.updateRenderConfig { it.copy(zoomScale = v) } }
         )
+        LabeledSlider(
+            label = "HDMI Overscan Edge Crop",
+            valueText = "${(cfg.overscanCropPercent * 100).toInt()}%",
+            value = cfg.overscanCropPercent,
+            valueRange = 0.0f..0.10f,
+            onValueChange = { v -> viewModel.updateRenderConfig { it.copy(overscanCropPercent = v) } }
+        )
     }
 
     SectionCard(
-        title = "OpenGL ES 3.0 Hardware Shader Pipeline",
+        title = "OpenGL ES 3.0 Hardware Shader & Filtering",
         icon = Icons.Default.DeveloperBoard
     ) {
+        Text(
+            text = "Texture Upscaling Filter",
+            color = Color(0xFFCBD5E1),
+            fontSize = 11.sp
+        )
+        Spacer(Modifier.height(4.dp))
+        FlowRow(
+            horizontalArrangement = Arrangement.spacedBy(6.dp),
+            verticalArrangement = Arrangement.spacedBy(6.dp)
+        ) {
+            TextureFilteringMode.entries.forEach { mode ->
+                FilterChip(
+                    selected = cfg.filteringMode == mode,
+                    onClick = { viewModel.updateRenderConfig { it.copy(filteringMode = mode) } },
+                    label = { Text(mode.label, fontSize = 11.sp) }
+                )
+            }
+        }
+
+        Spacer(Modifier.height(8.dp))
         Text(
             text = "Color Space Matrix & Dynamic Range",
             color = Color(0xFFCBD5E1),
@@ -1074,7 +1385,7 @@ private fun GpuAndAspectTab(
             Column(modifier = Modifier.weight(1f)) {
                 Text("Full RGB Range (0–255)", color = Color.White, fontSize = 12.sp)
                 Text(
-                    text = if (cfg.fullRangeRgb) "PC / Gaming Full Range (0–255)" else "Broadcast Limited Range (16–235 expanded)",
+                    text = if (cfg.fullRangeRgb) "PC / Console Full Range (0–255)" else "Broadcast Limited Range (16–235 expanded)",
                     color = Color(0xFF94A3B8),
                     fontSize = 11.sp
                 )
@@ -1115,6 +1426,13 @@ private fun GpuAndAspectTab(
             valueRange = 0.0f..2.0f,
             onValueChange = { v -> viewModel.updateRenderConfig { it.copy(saturation = v) } }
         )
+        LabeledSlider(
+            label = "Gamma",
+            valueText = String.format(Locale.US, "%.2f", cfg.gamma),
+            value = cfg.gamma,
+            valueRange = 0.6f..2.2f,
+            onValueChange = { v -> viewModel.updateRenderConfig { it.copy(gamma = v) } }
+        )
 
         Spacer(Modifier.height(6.dp))
         OutlinedButton(
@@ -1123,7 +1441,7 @@ private fun GpuAndAspectTab(
         ) {
             Icon(Icons.Default.RestartAlt, contentDescription = null, modifier = Modifier.size(16.dp))
             Spacer(Modifier.width(6.dp))
-            Text("Reset Shader & Geometry to Reference Defaults", fontSize = 12.sp)
+            Text("Reset Shader & Fullscreen Geometry", fontSize = 12.sp)
         }
     }
 }
@@ -1135,22 +1453,44 @@ private fun AudioAndHudTab(
     onRequestPermissions: () -> Unit
 ) {
     SectionCard(
-        title = "HDMI / USB Capture Digital Audio Passthrough",
-        icon = if (state.isAudioMuted) Icons.Default.VolumeOff else Icons.Default.VolumeUp
+        title = "Hiss-Free USB Digital Audio Passthrough",
+        icon = if (state.isAudioMuted) Icons.AutoMirrored.Filled.VolumeOff else Icons.AutoMirrored.Filled.VolumeUp
     ) {
+        Surface(
+            color = if (state.telemetry.usbAudioDeviceName != null) {
+                StudioEmerald.copy(alpha = 0.14f)
+            } else {
+                Color(0xFF0F172A)
+            },
+            shape = RoundedCornerShape(8.dp),
+            modifier = Modifier.fillMaxWidth()
+        ) {
+            Text(
+                text = if (state.telemetry.usbAudioDeviceName != null) {
+                    "Active USB Audio Source: ${state.telemetry.usbAudioDeviceName}"
+                } else {
+                    "USB Audio Standby: Automatically muted until a USB capture card audio endpoint is connected (prevents internal mic feedback hiss)"
+                },
+                color = if (state.telemetry.usbAudioDeviceName != null) StudioEmerald else Color(0xFF94A3B8),
+                fontSize = 11.sp,
+                modifier = Modifier.padding(10.dp)
+            )
+        }
+
+        Spacer(Modifier.height(8.dp))
         Row(
             verticalAlignment = Alignment.CenterVertically,
             modifier = Modifier.fillMaxWidth()
         ) {
             Column(modifier = Modifier.weight(1f)) {
                 Text(
-                    text = "Low-Latency 48kHz PCM Audio Loopback",
+                    text = "Low-Latency 48kHz PCM USB Audio Loopback",
                     color = Color.White,
                     fontWeight = FontWeight.SemiBold,
                     fontSize = 12.sp
                 )
                 Text(
-                    text = "Routes USB Capture Card digital audio directly to tablet/phone speakers",
+                    text = "Routes only external USB/HDMI capture audio to device speakers",
                     color = Color(0xFF94A3B8),
                     fontSize = 11.sp
                 )
@@ -1170,6 +1510,14 @@ private fun AudioAndHudTab(
             onValueChange = { viewModel.setAudioVolume(it) }
         )
 
+        LabeledSlider(
+            label = "Anti-Hiss Digital Noise Gate Threshold",
+            valueText = "${state.audioNoiseGateDb.toInt()} dBFS",
+            value = state.audioNoiseGateDb,
+            valueRange = -90f..-25f,
+            onValueChange = { viewModel.setAudioNoiseGateDb(it) }
+        )
+
         Spacer(Modifier.height(6.dp))
         Row(
             verticalAlignment = Alignment.CenterVertically,
@@ -1177,7 +1525,7 @@ private fun AudioAndHudTab(
             modifier = Modifier.fillMaxWidth()
         ) {
             Text(
-                text = "Live VU Peak Meter",
+                text = "Live USB Audio Peak Meter",
                 color = Color(0xFF94A3B8),
                 fontSize = 11.sp
             )
@@ -1185,7 +1533,7 @@ private fun AudioAndHudTab(
                 onClick = { viewModel.toggleAudioMute() },
                 leadingIcon = {
                     Icon(
-                        imageVector = if (state.isAudioMuted) Icons.Default.VolumeOff else Icons.Default.VolumeUp,
+                        imageVector = if (state.isAudioMuted) Icons.AutoMirrored.Filled.VolumeOff else Icons.AutoMirrored.Filled.VolumeUp,
                         contentDescription = null,
                         modifier = Modifier.size(15.dp)
                     )
@@ -1209,13 +1557,13 @@ private fun AudioAndHudTab(
                 onClick = onRequestPermissions,
                 modifier = Modifier.fillMaxWidth()
             ) {
-                Text("Grant Audio Capture Permission", fontSize = 12.sp)
+                Text("Grant USB Audio Capture Permission", fontSize = 12.sp)
             }
         }
     }
 
     SectionCard(
-        title = "Monitor Overlays & Guides",
+        title = "Monitor Overlays, Guides & Calibration",
         icon = Icons.Default.GridOn
     ) {
         Row(
@@ -1224,7 +1572,7 @@ private fun AudioAndHudTab(
         ) {
             Column(modifier = Modifier.weight(1f)) {
                 Text("Show Top-Left Signal Telemetry HUD", color = Color.White, fontSize = 12.sp)
-                Text("Displays resolution, FPS, bitrate, and USB standard", color = Color(0xFF94A3B8), fontSize = 11.sp)
+                Text("Hidden by default so 100% of the screen is clean", color = Color(0xFF94A3B8), fontSize = 11.sp)
             }
             Switch(
                 checked = state.showHudOverlay,
@@ -1239,12 +1587,29 @@ private fun AudioAndHudTab(
         ) {
             Column(modifier = Modifier.weight(1f)) {
                 Text("Rule-of-Thirds & Broadcast Safe Area Grid", color = Color.White, fontSize = 12.sp)
-                Text("Hardware shader overlay for framing & camera monitoring", color = Color(0xFF94A3B8), fontSize = 11.sp)
+                Text("Hardware shader framing overlay", color = Color(0xFF94A3B8), fontSize = 11.sp)
             }
             Switch(
                 checked = state.renderConfig.showSafeAreaGrid,
                 onCheckedChange = { show ->
                     viewModel.updateRenderConfig { it.copy(showSafeAreaGrid = show) }
+                }
+            )
+        }
+
+        Spacer(Modifier.height(8.dp))
+        Row(
+            verticalAlignment = Alignment.CenterVertically,
+            modifier = Modifier.fillMaxWidth()
+        ) {
+            Column(modifier = Modifier.weight(1f)) {
+                Text("SMPTE Calibration Test Pattern (When Disconnected)", color = Color.White, fontSize = 12.sp)
+                Text("Preview shader color grading & refresh motion bar without a capture card", color = Color(0xFF94A3B8), fontSize = 11.sp)
+            }
+            Switch(
+                checked = state.renderConfig.showTestPatternWhenNoSignal,
+                onCheckedChange = { show ->
+                    viewModel.updateRenderConfig { it.copy(showTestPatternWhenNoSignal = show) }
                 }
             )
         }
@@ -1254,10 +1619,11 @@ private fun AudioAndHudTab(
         title = "Hardware Pipeline Telemetry",
         icon = Icons.Default.Info
     ) {
+        TelemetryKeyValueRow("Capture Card Connected", if (state.isCaptureCardConnected) "Yes (${state.selectedDevice?.name})" else "No (Standby)")
+        TelemetryKeyValueRow("Host Screen Native Mode", state.hostDisplay.label)
         TelemetryKeyValueRow("Render Engine", state.telemetry.activeEngineName)
         TelemetryKeyValueRow("Measured Frame Time", String.format(Locale.US, "%.2f ms", state.telemetry.frameTimeMs))
-        TelemetryKeyValueRow("USB Host Link", state.selectedDevice?.usbVersionString ?: state.effectiveUsbStandard.label)
-        TelemetryKeyValueRow("USB VID:PID", state.selectedDevice?.hexVidPid ?: "2935:0002")
+        TelemetryKeyValueRow("USB Host Link", state.selectedDevice?.usbVersionString ?: "Awaiting USB Device")
         TelemetryKeyValueRow("Negotiation State", state.telemetry.negotiateStatus)
     }
 }
