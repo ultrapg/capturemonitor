@@ -112,6 +112,7 @@ import io.github.ultrapg.capturemonitor.model.AspectRatioPreset
 import io.github.ultrapg.capturemonitor.model.CaptureCardVendor
 import io.github.ultrapg.capturemonitor.model.CaptureDeviceInfo
 import io.github.ultrapg.capturemonitor.model.ColorSpaceMode
+import io.github.ultrapg.capturemonitor.model.GraphicsBackend
 import io.github.ultrapg.capturemonitor.model.TextureFilteringMode
 import io.github.ultrapg.capturemonitor.model.UsbStandard
 import io.github.ultrapg.capturemonitor.model.VideoFormat
@@ -646,7 +647,7 @@ private fun SlideOverMonitorControlPanel(
                         color = Color.White
                     )
                     Text(
-                        text = "Swipe edge or press Back to hide • v0.3.0",
+                        text = "Swipe edge or press Back to hide • v0.4.0",
                         fontSize = 11.sp,
                         color = Color(0xFF94A3B8)
                     )
@@ -1355,29 +1356,107 @@ private fun GpuAndAspectTab(
     }
 
     SectionCard(
-        title = "OpenGL ES 3.0 Hardware Shader & Filtering",
+        title = "Hardware Graphics Backend (Vulkan / OpenGL ES)",
         icon = Icons.Default.DeveloperBoard
     ) {
         Text(
-            text = "Texture Upscaling Filter",
-            color = Color(0xFFCBD5E1),
+            text = "Defaults to Vulkan 1.3 for low-overhead hardware acceleration across all GPUs. Switch between Vulkan and OpenGL ES anytime:",
+            color = Color(0xFF94A3B8),
             fontSize = 11.sp
         )
+        Spacer(Modifier.height(6.dp))
+        Row(
+            horizontalArrangement = Arrangement.spacedBy(8.dp),
+            modifier = Modifier.fillMaxWidth()
+        ) {
+            GraphicsBackend.entries.forEach { backend ->
+                val selected = cfg.graphicsBackend == backend
+                FilterChip(
+                    selected = selected,
+                    onClick = { viewModel.updateRenderConfig { it.copy(graphicsBackend = backend) } },
+                    label = {
+                        Text(
+                            text = backend.label,
+                            fontSize = 11.sp,
+                            fontWeight = if (selected) FontWeight.Bold else FontWeight.Medium
+                        )
+                    },
+                    colors = FilterChipDefaults.filterChipColors(
+                        selectedContainerColor = StudioCyan.copy(alpha = 0.24f),
+                        selectedLabelColor = StudioCyan
+                    )
+                )
+            }
+        }
         Spacer(Modifier.height(4.dp))
+        Surface(
+            color = Color(0xFF0F172A),
+            shape = RoundedCornerShape(8.dp),
+            modifier = Modifier.fillMaxWidth()
+        ) {
+            Column(modifier = Modifier.padding(8.dp)) {
+                Text(
+                    text = cfg.graphicsBackend.engineTitle,
+                    color = StudioCyan,
+                    fontSize = 11.sp,
+                    fontFamily = FontFamily.Monospace,
+                    fontWeight = FontWeight.Bold
+                )
+                Spacer(Modifier.height(2.dp))
+                Text(
+                    text = cfg.graphicsBackend.description,
+                    color = Color(0xFF94A3B8),
+                    fontSize = 11.sp
+                )
+            }
+        }
+    }
+
+    SectionCard(
+        title = "Hardware Upscaling & Super Resolution Filters",
+        icon = Icons.Default.HighQuality
+    ) {
+        Text(
+            text = "Active Filter: ${cfg.filteringMode.label}",
+            color = StudioCyan,
+            fontWeight = FontWeight.SemiBold,
+            fontSize = 12.sp
+        )
+        Text(
+            text = cfg.filteringMode.description,
+            color = Color(0xFF94A3B8),
+            fontSize = 11.sp
+        )
+        Spacer(Modifier.height(8.dp))
         FlowRow(
             horizontalArrangement = Arrangement.spacedBy(6.dp),
             verticalArrangement = Arrangement.spacedBy(6.dp)
         ) {
             TextureFilteringMode.entries.forEach { mode ->
+                val selected = cfg.filteringMode == mode
                 FilterChip(
-                    selected = cfg.filteringMode == mode,
+                    selected = selected,
                     onClick = { viewModel.updateRenderConfig { it.copy(filteringMode = mode) } },
-                    label = { Text(mode.label, fontSize = 11.sp) }
+                    label = { Text(mode.label, fontSize = 11.sp) },
+                    colors = FilterChipDefaults.filterChipColors(
+                        selectedContainerColor = StudioCyan.copy(alpha = 0.22f),
+                        selectedLabelColor = StudioCyan
+                    )
                 )
             }
         }
 
         Spacer(Modifier.height(8.dp))
+        LabeledSlider(
+            label = "Upscaler / FSR RCAS / NIS / GSR Sharpness",
+            valueText = "${(cfg.sharpness * 100).toInt()}%",
+            value = cfg.sharpness,
+            valueRange = 0f..1f,
+            onValueChange = { v -> viewModel.updateRenderConfig { it.copy(sharpness = v) } }
+        )
+
+        HorizontalDivider(modifier = Modifier.padding(vertical = 8.dp), color = Color.White.copy(alpha = 0.08f))
+
         Text(
             text = "Color Space Matrix & Dynamic Range",
             color = Color(0xFFCBD5E1),
@@ -1419,13 +1498,6 @@ private fun GpuAndAspectTab(
         HorizontalDivider(modifier = Modifier.padding(vertical = 8.dp), color = Color.White.copy(alpha = 0.08f))
 
         LabeledSlider(
-            label = "CAS GPU Sharpness",
-            valueText = "${(cfg.sharpness * 100).toInt()}%",
-            value = cfg.sharpness,
-            valueRange = 0f..1f,
-            onValueChange = { v -> viewModel.updateRenderConfig { it.copy(sharpness = v) } }
-        )
-        LabeledSlider(
             label = "Brightness",
             valueText = String.format(Locale.US, "%+.0f%%", cfg.brightness * 100f),
             value = cfg.brightness,
@@ -1461,7 +1533,7 @@ private fun GpuAndAspectTab(
         ) {
             Icon(Icons.Default.RestartAlt, contentDescription = null, modifier = Modifier.size(16.dp))
             Spacer(Modifier.width(6.dp))
-            Text("Reset Shader & Fullscreen Geometry", fontSize = 12.sp)
+            Text("Reset Backend, Upscaler & Fullscreen Geometry", fontSize = 12.sp)
         }
     }
 }

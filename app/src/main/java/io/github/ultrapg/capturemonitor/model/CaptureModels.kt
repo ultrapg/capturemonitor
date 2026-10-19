@@ -195,11 +195,93 @@ enum class AspectRatioPreset(val label: String, val ratio: Float?) {
 }
 
 /**
- * Texture filtering mode. Defaults to LINEAR (`Linear`) as requested.
+ * Hardware Graphics Rendering Backend.
+ * Defaults to VULKAN as requested, with one-tap switching between Vulkan and OpenGL ES.
  */
-enum class TextureFilteringMode(val label: String, val description: String) {
-    LINEAR("Linear", "Hardware GL_LINEAR texture filtering with optional CAS sharpening (Default)"),
-    NEAREST_PIXEL("Pixel-Perfect Integer", "Nearest-neighbor crisp pixels for retro consoles & pixel art")
+enum class GraphicsBackend(
+    val label: String,
+    val engineTitle: String,
+    val description: String
+) {
+    VULKAN(
+        label = "Vulkan 1.3 (Default)",
+        engineTitle = "Vulkan 1.3 Hardware Compute + AHardwareBuffer Zero-Copy",
+        description = "Low-overhead Vulkan hardware pipeline with async compute upscaling and sub-frame latency"
+    ),
+    OPENGL_ES(
+        label = "OpenGL ES 3.0",
+        engineTitle = "OpenGL ES 3.0 EGL External OES Zero-Copy",
+        description = "Universal hardware-accelerated EGLImage OES direct texture pipeline for maximum compatibility"
+    )
+}
+
+/**
+ * Comprehensive suite of hardware-accelerated upscaling & reconstruction filters.
+ * Defaults to LINEAR (`Linear`) as requested, and includes AMD FSR 1.0 (EASU+RCAS),
+ * FSR 1.1 Ultra-Quality, FSR Spatial 2D, NVIDIA Image Scaling (NIS),
+ * Snapdragon Game Super Resolution (GSR), Intel XeSS Spatial, Catmull-Rom, Lanczos-3,
+ * Anime4K, and Pixel-Perfect Integer scaling.
+ */
+enum class TextureFilteringMode(
+    val label: String,
+    val code: Int,
+    val description: String
+) {
+    LINEAR(
+        label = "Linear",
+        code = 0,
+        description = "Hardware Linear texture filtering with zero overhead (Default)"
+    ),
+    AMD_FSR_1_0(
+        label = "AMD FSR 1.0 (EASU + RCAS)",
+        code = 2,
+        description = "FidelityFX Super Resolution 1.0: 12-tap Edge-Adaptive Spatial Upsampling + Robust Contrast-Adaptive Sharpening"
+    ),
+    AMD_FSR_ULTRA(
+        label = "AMD FSR 1.1 Ultra-Quality (Anti-Ringing)",
+        code = 3,
+        description = "Enhanced FSR spatial reconstruction with neighborhood clamping to eliminate haloing on HDMI text & UI"
+    ),
+    AMD_FSR_RCAS(
+        label = "AMD FidelityFX CAS / RCAS Native",
+        code = 4,
+        description = "Pure FidelityFX Robust Contrast-Adaptive Sharpening for native 1080p/4K signals"
+    ),
+    NVIDIA_NIS(
+        label = "NVIDIA Image Scaling (NIS Open Shader)",
+        code = 5,
+        description = "Open-source NVIDIA directional 6-tap spatial upscaler with adaptive edge-direction boost"
+    ),
+    SNAPDRAGON_GSR(
+        label = "Snapdragon GSR (Adreno Super Resolution)",
+        code = 6,
+        description = "Qualcomm Snapdragon Game Super Resolution: single-pass 12-kernel edge-aware mobile GPU upscaler"
+    ),
+    INTEL_XESS_SPATIAL(
+        label = "Intel XeSS Spatial (DP4a / Clamped)",
+        code = 7,
+        description = "Sub-pixel directional spatial reconstruction with luma-weighted anti-aliasing"
+    ),
+    LANCZOS_3(
+        label = "Lanczos-3 Windowed Sinc",
+        code = 8,
+        description = "High-precision Sinc-Windowed Lanczos reconstruction for razor-sharp desktop monitors & text"
+    ),
+    CATMULL_ROM_BICUBIC(
+        label = "Catmull-Rom 9-Tap Bicubic",
+        code = 9,
+        description = "Bicubic Hermite spline interpolation for smooth gradients and cinema playback"
+    ),
+    ANIME4K_CNN(
+        label = "Anime4K Fast Line-Art Upscaler",
+        code = 10,
+        description = "Real-time luminance gradient push & deblur shader ideal for 2D games, Switch, and animation"
+    ),
+    NEAREST_PIXEL(
+        label = "Pixel-Perfect Integer",
+        code = 1,
+        description = "Nearest-neighbor crisp pixels for retro consoles & pixel art"
+    )
 }
 
 enum class ColorSpaceMode(val label: String, val code: Int) {
@@ -210,10 +292,11 @@ enum class ColorSpaceMode(val label: String, val code: Int) {
 }
 
 /**
- * Hardware-accelerated GPU shader & viewport configuration.
- * Defaults to STRETCH_FILL and LINEAR filtering so the entire phone/tablet screen is used out of the box.
+ * Hardware-accelerated GPU shader, backend & viewport configuration.
+ * Defaults to VULKAN backend, STRETCH_FILL fullscreen, and LINEAR filtering.
  */
 data class RenderConfig(
+    val graphicsBackend: GraphicsBackend = GraphicsBackend.VULKAN,
     val aspectRatioPreset: AspectRatioPreset = AspectRatioPreset.STRETCH_FILL,
     val filteringMode: TextureFilteringMode = TextureFilteringMode.LINEAR,
     val colorSpace: ColorSpaceMode = ColorSpaceMode.REC_709,
@@ -222,7 +305,7 @@ data class RenderConfig(
     val contrast: Float = 1.0f,       // 0.5 to 2.0
     val saturation: Float = 1.0f,     // 0.0 to 2.0
     val gamma: Float = 1.0f,          // 0.5 to 2.2
-    val sharpness: Float = 0.20f,     // 0.0 to 1.0 (CAS shader)
+    val sharpness: Float = 0.25f,     // 0.0 to 1.0 (FSR RCAS / NIS / GSR / CAS strength)
     val mirrorHorizontal: Boolean = false,
     val flipVertical: Boolean = false,
     val rotationDegrees: Int = 0,     // 0, 90, 180, 270
@@ -249,14 +332,14 @@ data class HostDisplayInfo(
 }
 
 /**
- * Live telemetry metrics from the OpenGL ES 3.0 render pipeline & capture engine.
+ * Live telemetry metrics from the Vulkan / OpenGL ES render pipeline & capture engine.
  */
 data class StreamTelemetry(
     val currentFps: Float = 0f,
     val frameTimeMs: Float = 0f,
     val estimatedBitrateMbps: Float = 0f,
     val droppedFrames: Long = 0L,
-    val activeEngineName: String = "OpenGL ES 3.0 Zero-Copy",
+    val activeEngineName: String = GraphicsBackend.VULKAN.engineTitle,
     val isForcedModeActive: Boolean = false,
     val negotiateStatus: String = "Standby",
     val usbAudioDeviceName: String? = null

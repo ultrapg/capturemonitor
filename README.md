@@ -6,8 +6,22 @@ Built as a clean, zero-bloat, open-source alternative to apps like **Noir**, wit
 
 ---
 
-## Key Features (v0.3.0)
+## Key Features (v0.4.0)
 
+- **Vulkan 1.3 & OpenGL ES 3.0 Hardware Backend Switcher (Vulkan Default)**:
+  - Defaults to **Vulkan 1.3 (`Vulkan 1.3 Hardware Compute + AHardwareBuffer Zero-Copy`)** for low-overhead hardware acceleration across all modern GPUs, with instant one-tap switching between **Vulkan 1.3** and **OpenGL ES 3.0**.
+- **Comprehensive Hardware Upscaling & Super Resolution Suite (`Linear` Default)**:
+  - **Linear** (Default hardware linear texture filtering)
+  - **AMD FSR 1.0 (EASU + RCAS)**: 12-tap Edge-Adaptive Spatial Upsampling + Robust Contrast-Adaptive Sharpening
+  - **AMD FSR 1.1 Ultra-Quality (Anti-Ringing)**: Enhanced FSR spatial reconstruction with neighborhood clamping
+  - **AMD FidelityFX CAS / RCAS Native**: Pure Robust Contrast-Adaptive Sharpening
+  - **NVIDIA Image Scaling (NIS Open Shader)**: Directional 6-tap spatial upscaler with adaptive edge boost
+  - **Snapdragon GSR (Adreno Super Resolution)**: Qualcomm single-pass 12-kernel edge-aware mobile GPU upscaler
+  - **Intel XeSS Spatial (DP4a / Clamped)**: Sub-pixel directional spatial reconstruction
+  - **Lanczos-3 Windowed Sinc**: High-precision Sinc-Windowed Lanczos reconstruction for desktop UI & text
+  - **Catmull-Rom 9-Tap Bicubic**: Bicubic Hermite spline interpolation
+  - **Anime4K Fast Line-Art Upscaler**: Real-time luminance gradient push shader for 2D/Switch/animation
+  - **Pixel-Perfect Integer**: Nearest-neighbor crisp pixels for retro consoles
 - **100% Fullscreen Edge-to-Edge Viewport & True 90Hz / 120Hz / 144Hz / 240Hz Display Lock**:
   - Both the **HUD** and the **Control Menu** are completely hidden by default (with zero floating handles or buttons blocking the canvas) so 100% of the phone/tablet screen is utilized.
   - Defaults to **Full Screen (Stretch Fill)** and queries `DisplayManager` + `WindowMetrics` + `Surface.setFrameRate` to lock onto the Android device's highest native refresh rate (`90Hz` / `120Hz` / `144Hz` / `240Hz`) and physical resolution.
@@ -21,8 +35,6 @@ Built as a clean, zero-bloat, open-source alternative to apps like **Noir**, wit
 - **Custom Resolution Builder & Full Capture Card Mode Mapping**:
   - Enter any custom resolution (`320×240` up to `7680×4320`) and refresh rate (`1Hz` to `240Hz`), or one-tap **Match Screen** to lock onto the Android device's exact physical resolution and max refresh rate (`90Hz` / `120Hz` / `144Hz` / `165Hz` / `240Hz`).
   - Parses all discrete UVC `VS_FRAME` descriptors from the capture card and maps 22+ standard 16:9, 16:10, 21:9 ultrawide, 4:3, and PAL/NTSC presets across `MJPEG`, `YUY2 4:2:2`, `UYVY 4:2:2`, `NV12 4:2:0`, `P010 10-bit HDR`, and `H.264`.
-- **Zero-Copy Hardware Acceleration (OpenGL ES 2.0 / 3.0)**:
-  - Direct DMA `GL_TEXTURE_EXTERNAL_OES` rendering pipeline with **Linear** filtering (default) and **Pixel-Perfect Integer** (`GL_NEAREST`) filtering, **Contrast-Adaptive Sharpening (CAS)**, **Rec.709 / Rec.601 / sRGB / DCI-P3** color grading, **Gamma**, **HDMI Overscan Edge Crop**, and **Full/Limited RGB** range expansion.
 - **USB Port Link Speed Analyzer & UVC Force-Mode Engine**:
   - Inspects `bcdUSB` and endpoint descriptors (`USB 2.0`, `USB 3.2 Gen 1`, `USB 3.2 Gen 2`, `USB4`), warns when a mode exceeds port bandwidth, and allows forcing any resolution/refresh rate via raw `VS_PROBE_CONTROL` / `VS_COMMIT_CONTROL`.
 

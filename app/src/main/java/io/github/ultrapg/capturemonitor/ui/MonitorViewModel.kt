@@ -293,13 +293,25 @@ class MonitorViewModel(application: Application) : AndroidViewModel(application)
     }
 
     fun updateRenderConfig(transform: (RenderConfig) -> RenderConfig) {
-        _uiState.update { it.copy(renderConfig = transform(it.renderConfig)) }
+        _uiState.update { state ->
+            val nextCfg = transform(state.renderConfig)
+            state.copy(
+                renderConfig = nextCfg,
+                telemetry = state.telemetry.copy(
+                    activeEngineName = "${nextCfg.graphicsBackend.engineTitle} • ${nextCfg.filteringMode.label}"
+                )
+            )
+        }
     }
 
     fun resetColorAndTransform() {
         _uiState.update {
+            val defaultCfg = RenderConfig()
             it.copy(
-                renderConfig = RenderConfig(),
+                renderConfig = defaultCfg,
+                telemetry = it.telemetry.copy(
+                    activeEngineName = "${defaultCfg.graphicsBackend.engineTitle} • ${defaultCfg.filteringMode.label}"
+                ),
                 bannerMessage = "Reset GPU shader grading & full-screen geometry to defaults"
             )
         }

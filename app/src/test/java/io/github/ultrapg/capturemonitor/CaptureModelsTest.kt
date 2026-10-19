@@ -2,6 +2,7 @@ package io.github.ultrapg.capturemonitor
 
 import io.github.ultrapg.capturemonitor.model.AspectRatioPreset
 import io.github.ultrapg.capturemonitor.model.CaptureCardVendor
+import io.github.ultrapg.capturemonitor.model.GraphicsBackend
 import io.github.ultrapg.capturemonitor.model.RenderConfig
 import io.github.ultrapg.capturemonitor.model.TextureFilteringMode
 import io.github.ultrapg.capturemonitor.model.UsbStandard
@@ -23,14 +24,20 @@ class CaptureModelsTest {
     }
 
     @Test
-    fun defaultUiStateHasHiddenHudAndMenuFullScreenStretchAndLinearFilter() {
+    fun defaultUiStateUsesVulkanBackendLinearFilterFullScreenAndHiddenOverlays() {
         val state = MonitorUiState()
         assertFalse(state.isPanelOpen)
         assertFalse(state.showHudOverlay)
         assertFalse(state.isCaptureCardConnected)
-        assertEquals(AspectRatioPreset.STRETCH_FILL, RenderConfig().aspectRatioPreset)
-        assertEquals(TextureFilteringMode.LINEAR, RenderConfig().filteringMode)
-        assertEquals("Linear", RenderConfig().filteringMode.label)
+        val cfg = RenderConfig()
+        assertEquals(GraphicsBackend.VULKAN, cfg.graphicsBackend)
+        assertEquals(AspectRatioPreset.STRETCH_FILL, cfg.aspectRatioPreset)
+        assertEquals(TextureFilteringMode.LINEAR, cfg.filteringMode)
+        assertEquals("Linear", cfg.filteringMode.label)
+        assertTrue(TextureFilteringMode.entries.contains(TextureFilteringMode.AMD_FSR_1_0))
+        assertTrue(TextureFilteringMode.entries.contains(TextureFilteringMode.AMD_FSR_ULTRA))
+        assertTrue(TextureFilteringMode.entries.contains(TextureFilteringMode.NVIDIA_NIS))
+        assertTrue(TextureFilteringMode.entries.contains(TextureFilteringMode.SNAPDRAGON_GSR))
     }
 
     @Test
