@@ -108,10 +108,13 @@ import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import androidx.compose.ui.viewinterop.AndroidView
 import io.github.ultrapg.capturemonitor.gl.HardwareVideoRenderer
+import io.github.ultrapg.capturemonitor.gl.VulkanHardwarePipeline
 import io.github.ultrapg.capturemonitor.model.AspectRatioPreset
 import io.github.ultrapg.capturemonitor.model.CaptureCardVendor
 import io.github.ultrapg.capturemonitor.model.CaptureDeviceInfo
 import io.github.ultrapg.capturemonitor.model.ColorSpaceMode
+import io.github.ultrapg.capturemonitor.model.FrameGenMode
+import io.github.ultrapg.capturemonitor.model.FrameGenMultiplier
 import io.github.ultrapg.capturemonitor.model.GraphicsBackend
 import io.github.ultrapg.capturemonitor.model.TextureFilteringMode
 import io.github.ultrapg.capturemonitor.model.UsbStandard
@@ -237,8 +240,8 @@ fun CaptureMonitorScreen(
                     val renderer = HardwareVideoRenderer(
                         context = ctx,
                         glSurfaceView = this,
-                        onTelemetryTick = { fps, frameMs, isLive, gpuName ->
-                            viewModel.onRendererTelemetry(fps, frameMs, isLive, gpuName)
+                        onTelemetryTick = { srcFps, outFps, genFps, frameMs, isLive, gpuName ->
+                            viewModel.onRendererTelemetry(srcFps, outFps, genFps, frameMs, isLive, gpuName)
                         }
                     )
                     renderer.updateRenderConfig(state.renderConfig)
@@ -249,10 +252,12 @@ fun CaptureMonitorScreen(
                     )
                     setRenderer(renderer)
                     renderMode = GLSurfaceView.RENDERMODE_CONTINUOUSLY
+                    VulkanHardwarePipeline.syncViewBackend(this, state.renderConfig)
                     rendererRef = renderer
                 }
             },
             update = { glView ->
+                VulkanHardwarePipeline.syncViewBackend(glView, state.renderConfig)
                 if (android.os.Build.VERSION.SDK_INT >= android.os.Build.VERSION_CODES.R) {
                     val targetHz = maxOf(state.hostDisplay.maxRefreshRateHz, state.selectedMode.fps).toFloat()
                     try {
@@ -556,15 +561,22 @@ private fun TopSignalTelemetryHud(
 
                 Spacer(Modifier.height(2.dp))
                 Row(verticalAlignment = Alignment.CenterVertically) {
+                    val srcFps = state.telemetry.currentFps.takeIf { it > 1f } ?: mode.fps.toFloat()
+                    val outFps = state.telemetry.outputPresentedFps.takeIf { it > 1f } ?: srcFps
+                    val fpsLabel = if (state.renderConfig.frameGenMode != FrameGenMode.OFF) {
+                        "${String.format(Locale.US, "%.0f", srcFps)}→${String.format(Locale.US, "%.0f", outFps)}Hz (${state.renderConfig.frameGenMode.label})"
+                    } else {
+                        "${String.format(Locale.US, "%.0f", srcFps)}Hz"
+                    }
                     Text(
-                        text = "${mode.resolutionLabel} @ ${String.format(Locale.US, "%.0f", state.telemetry.currentFps.takeIf { it > 1f } ?: mode.fps.toFloat())}Hz",
+                        text = "${mode.resolutionLabel} @ $fpsLabel",
                         color = StudioCyan,
                         fontSize = 11.sp,
                         fontFamily = FontFamily.Monospace,
                         fontWeight = FontWeight.Bold
                     )
                     Text(
-                        text = " • ${mode.format.shortName} • ${mode.requiredMbps} Mbps • ${usbStd.specName}",
+                        text = " • ${state.renderConfig.graphicsBackend.label} • ${state.renderConfig.filteringMode.label} • ${usbStd.specName}",
                         color = Color(0xFFCBD5E1),
                         fontSize = 11.sp,
                         fontFamily = FontFamily.Monospace
@@ -647,7 +659,7 @@ private fun SlideOverMonitorControlPanel(
                         color = Color.White
                     )
                     Text(
-                        text = "Swipe edge or press Back to hide • v0.4.0",
+                        text = "Swipe edge or press Back to hide • v0.5.0",
                         fontSize = 11.sp,
                         color = Color(0xFF94A3B8)
                     )
@@ -1454,14 +1466,98 @@ private fun GpuAndAspectTab(
             valueRange = 0f..1f,
             onValueChange = { v -> viewModel.updateRenderConfig { it.copy(sharpness = v) } }
         )
+    }
 
-        HorizontalDivider(modifier = Modifier.padding(vertical = 8.dp), color = Color.White.copy(alpha = 0.08f))
-
+    SectionCard(
+        title = "Open Frame Generation & Motion Interpolation (FG)",
+        icon = Icons.Default.Speed
+    ) {
         Text(
-            text = "Color Space Matrix & Dynamic Range",
-            color = Color(0xFFCBD5E1),
+            text = "Active FG Model: ${cfg.frameGenMode.label}",
+            color = if (cfg.frameGenMode != FrameGenMode.OFF) StudioEmerald else StudioCyan,
+            fontWeight = FontWeight.SemiBold,
+            fontSize = 12.sp
+        )
+        Text(
+            text = cfg.frameGenMode.description,
+            color = Color(0xFF94A3B8),
             fontSize = 11.sp
         )
+        Spacer(Modifier.height(8.dp))
+        FlowRow(
+            horizontalArrangement = Arrangement.spacedBy(6.dp),
+            verticalArrangement = Arrangement.spacedBy(6.dp)
+        ) {
+            FrameGenMode.entries.forEach { fg ->
+                val selected = cfg.frameGenMode == fg
+                FilterChip(
+                    selected = selected,
+                    onClick = { viewModel.updateRenderConfig { it.copy(frameGenMode = fg) } },
+                    label = { Text(fg.label, fontSize = 11.sp) },
+                    colors = FilterChipDefaults.filterChipColors(
+                        selectedContainerColor = if (fg != FrameGenMode.OFF) StudioEmerald.copy(alpha = 0.22f) else StudioCyan.copy(alpha = 0.22f),
+                        selectedLabelColor = if (fg != FrameGenMode.OFF) StudioEmerald else StudioCyan
+                    )
+                )
+            }
+        }
+
+        if (cfg.frameGenMode != FrameGenMode.OFF) {
+            Spacer(Modifier.height(8.dp))
+            Text(
+                text = "Frame Generation Target Multiplier:",
+                color = Color(0xFFCBD5E1),
+                fontSize = 11.sp
+            )
+            Spacer(Modifier.height(4.dp))
+            FlowRow(
+                horizontalArrangement = Arrangement.spacedBy(6.dp),
+                verticalArrangement = Arrangement.spacedBy(6.dp)
+            ) {
+                FrameGenMultiplier.entries.forEach { mult ->
+                    FilterChip(
+                        selected = cfg.frameGenMultiplier == mult,
+                        onClick = { viewModel.updateRenderConfig { it.copy(frameGenMultiplier = mult) } },
+                        label = { Text(mult.label, fontSize = 11.sp) }
+                    )
+                }
+            }
+
+            Spacer(Modifier.height(6.dp))
+            LabeledSlider(
+                label = "Optical Flow Motion Vector Scale",
+                valueText = "${String.format(Locale.US, "%.2f", cfg.frameGenMotionScale)}×",
+                value = cfg.frameGenMotionScale,
+                valueRange = 0.25f..2.0f,
+                onValueChange = { v -> viewModel.updateRenderConfig { it.copy(frameGenMotionScale = v) } }
+            )
+            LabeledSlider(
+                label = "Disocclusion & Anti-Ghosting Clamp",
+                valueText = "${(cfg.frameGenAntiGhosting * 100).toInt()}%",
+                value = cfg.frameGenAntiGhosting,
+                valueRange = 0f..1f,
+                onValueChange = { v -> viewModel.updateRenderConfig { it.copy(frameGenAntiGhosting = v) } }
+            )
+            Row(
+                verticalAlignment = Alignment.CenterVertically,
+                modifier = Modifier.fillMaxWidth()
+            ) {
+                Column(modifier = Modifier.weight(1f)) {
+                    Text("Static HUD / Crosshair / Text Protection", color = Color.White, fontSize = 12.sp)
+                    Text("Prevents UI overlays and text from warping during fast camera pans", color = Color(0xFF94A3B8), fontSize = 11.sp)
+                }
+                Switch(
+                    checked = cfg.frameGenUiProtection,
+                    onCheckedChange = { prot -> viewModel.updateRenderConfig { it.copy(frameGenUiProtection = prot) } }
+                )
+            }
+        }
+    }
+
+    SectionCard(
+        title = "Color Space Matrix & Dynamic Range Grading",
+        icon = Icons.Default.Tune
+    ) {
         Spacer(Modifier.height(4.dp))
         FlowRow(
             horizontalArrangement = Arrangement.spacedBy(6.dp),
@@ -1714,6 +1810,16 @@ private fun AudioAndHudTab(
         TelemetryKeyValueRow("Capture Card Connected", if (state.isCaptureCardConnected) "Yes (${state.selectedDevice?.name})" else "No (Standby)")
         TelemetryKeyValueRow("Host Screen Native Mode", state.hostDisplay.label)
         TelemetryKeyValueRow("Render Engine", state.telemetry.activeEngineName)
+        TelemetryKeyValueRow("Source Input FPS", String.format(Locale.US, "%.1f FPS", state.telemetry.currentFps))
+        TelemetryKeyValueRow(
+            "Output Presented FPS (with FG)",
+            String.format(
+                Locale.US,
+                "%.1f FPS (+%.1f FG)",
+                state.telemetry.outputPresentedFps,
+                state.telemetry.generatedFramesPerSec
+            )
+        )
         TelemetryKeyValueRow("Measured Frame Time", String.format(Locale.US, "%.2f ms", state.telemetry.frameTimeMs))
         TelemetryKeyValueRow("USB Host Link", state.selectedDevice?.usbVersionString ?: "Awaiting USB Device")
         TelemetryKeyValueRow("Negotiation State", state.telemetry.negotiateStatus)

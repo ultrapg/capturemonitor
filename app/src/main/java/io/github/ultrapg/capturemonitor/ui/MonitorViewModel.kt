@@ -341,7 +341,14 @@ class MonitorViewModel(application: Application) : AndroidViewModel(application)
         _uiState.update { it.copy(isAudioMuted = nextMute) }
     }
 
-    fun onRendererTelemetry(fps: Float, frameTimeMs: Float, isReceivingLiveFrames: Boolean, gpuHardwareName: String) {
+    fun onRendererTelemetry(
+        sourceFps: Float,
+        presentedFps: Float,
+        generatedFps: Float,
+        frameTimeMs: Float,
+        isReceivingLiveFrames: Boolean,
+        gpuHardwareName: String
+    ) {
         _uiState.update { state ->
             val bitrate = if (state.isCaptureCardConnected || state.renderConfig.showTestPatternWhenNoSignal) {
                 state.selectedMode.requiredMbps.toFloat()
@@ -349,13 +356,20 @@ class MonitorViewModel(application: Application) : AndroidViewModel(application)
                 0f
             }
             val cfg = state.renderConfig
+            val fgSuffix = if (cfg.frameGenMode != io.github.ultrapg.capturemonitor.model.FrameGenMode.OFF) {
+                " • ${cfg.frameGenMode.label}"
+            } else {
+                ""
+            }
             state.copy(
                 isReceivingLiveFrames = isReceivingLiveFrames,
                 telemetry = state.telemetry.copy(
-                    currentFps = fps,
+                    currentFps = sourceFps,
+                    outputPresentedFps = presentedFps,
+                    generatedFramesPerSec = generatedFps,
                     frameTimeMs = frameTimeMs,
                     estimatedBitrateMbps = bitrate,
-                    activeEngineName = "${cfg.graphicsBackend.label} • $gpuHardwareName • ${cfg.filteringMode.label}"
+                    activeEngineName = "${cfg.graphicsBackend.label} • $gpuHardwareName • ${cfg.filteringMode.label}$fgSuffix"
                 )
             )
         }

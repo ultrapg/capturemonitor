@@ -2,6 +2,8 @@ package io.github.ultrapg.capturemonitor
 
 import io.github.ultrapg.capturemonitor.model.AspectRatioPreset
 import io.github.ultrapg.capturemonitor.model.CaptureCardVendor
+import io.github.ultrapg.capturemonitor.model.FrameGenMode
+import io.github.ultrapg.capturemonitor.model.FrameGenMultiplier
 import io.github.ultrapg.capturemonitor.model.GraphicsBackend
 import io.github.ultrapg.capturemonitor.model.RenderConfig
 import io.github.ultrapg.capturemonitor.model.TextureFilteringMode
@@ -38,6 +40,29 @@ class CaptureModelsTest {
         assertTrue(TextureFilteringMode.entries.contains(TextureFilteringMode.AMD_FSR_ULTRA))
         assertTrue(TextureFilteringMode.entries.contains(TextureFilteringMode.NVIDIA_NIS))
         assertTrue(TextureFilteringMode.entries.contains(TextureFilteringMode.SNAPDRAGON_GSR))
+    }
+
+    @Test
+    fun openFrameGenerationModelsAndMultipliersAreConfiguredProperly() {
+        assertTrue(FrameGenMode.entries.contains(FrameGenMode.WINFG_OPTICAL_FLOW))
+        assertTrue(FrameGenMode.entries.contains(FrameGenMode.AMD_FSR3_FMMF))
+        assertTrue(FrameGenMode.entries.contains(FrameGenMode.RIFE_LITE_SHADER))
+        assertTrue(FrameGenMode.entries.contains(FrameGenMode.SGSR_2_TEMPORAL))
+        assertTrue(FrameGenMode.entries.contains(FrameGenMode.SVP_MEMC_BLOCK))
+
+        val cfg = RenderConfig(
+            frameGenMode = FrameGenMode.WINFG_OPTICAL_FLOW,
+            frameGenMultiplier = FrameGenMultiplier.DOUBLE_2X,
+            frameGenMotionScale = 1.25f,
+            frameGenAntiGhosting = 0.80f,
+            frameGenUiProtection = true
+        )
+        assertEquals(FrameGenMode.WINFG_OPTICAL_FLOW, cfg.frameGenMode)
+        assertEquals(FrameGenMultiplier.DOUBLE_2X, cfg.frameGenMultiplier)
+        assertEquals(2, cfg.frameGenMultiplier.factor)
+        assertEquals(1.25f, cfg.frameGenMotionScale, 0.001f)
+        assertEquals(0.80f, cfg.frameGenAntiGhosting, 0.001f)
+        assertTrue(cfg.frameGenUiProtection)
     }
 
     @Test

@@ -196,7 +196,8 @@ enum class AspectRatioPreset(val label: String, val ratio: Float?) {
 
 /**
  * Hardware Graphics Rendering Backend.
- * Defaults to VULKAN as requested, with one-tap switching between Vulkan and OpenGL ES.
+ * Defaults to VULKAN as requested, with live switching between the Vulkan Surface/AGSL pipeline
+ * and the OpenGL ES 3.0 Multi-Pass FBO pipeline.
  */
 enum class GraphicsBackend(
     val label: String,
@@ -205,22 +206,19 @@ enum class GraphicsBackend(
 ) {
     VULKAN(
         label = "Vulkan 1.3 (Default)",
-        engineTitle = "Vulkan 1.3 Hardware Compute + AHardwareBuffer Zero-Copy",
-        description = "Low-overhead Vulkan hardware pipeline with async compute upscaling and sub-frame latency"
+        engineTitle = "Vulkan 1.3 Hardware Pipeline (SkiaVk + SPIR-V / Multi-Pass)",
+        description = "Low-overhead Vulkan hardware pipeline with SPIR-V AGSL RuntimeShader + multi-pass FBO temporal history"
     ),
     OPENGL_ES(
         label = "OpenGL ES 3.0",
-        engineTitle = "OpenGL ES 3.0 EGL External OES Zero-Copy",
-        description = "Universal hardware-accelerated EGLImage OES direct texture pipeline for maximum compatibility"
+        engineTitle = "OpenGL ES 3.0 Multi-Pass FBO + Zero-Copy OES",
+        description = "Universal hardware-accelerated EGLImage OES + dual ping-pong FBO pipeline"
     )
 }
 
 /**
  * Comprehensive suite of hardware-accelerated upscaling & reconstruction filters.
- * Defaults to LINEAR (`Linear`) as requested, and includes AMD FSR 1.0 (EASU+RCAS),
- * FSR 1.1 Ultra-Quality, FSR Spatial 2D, NVIDIA Image Scaling (NIS),
- * Snapdragon Game Super Resolution (GSR), Intel XeSS Spatial, Catmull-Rom, Lanczos-3,
- * Anime4K, and Pixel-Perfect Integer scaling.
+ * Defaults to LINEAR (`Linear`) as requested.
  */
 enum class TextureFilteringMode(
     val label: String,
@@ -284,6 +282,58 @@ enum class TextureFilteringMode(
     )
 }
 
+/**
+ * Open-source Frame Generation & Motion Interpolation models.
+ * Runs in real-time on the GPU using a ping-pong Framebuffer Object (FBO) history ring (`prevFrameTex` + `currFrameTex`)
+ * to generate intermediate frames at the display's native refresh rate (e.g., 30->60, 60->120, 60->240Hz).
+ */
+enum class FrameGenMode(
+    val label: String,
+    val code: Int,
+    val description: String
+) {
+    OFF(
+        label = "Off (Native Passthrough)",
+        code = 0,
+        description = "Zero frame generation; displays raw capture card frames with minimum latency"
+    ),
+    WINFG_OPTICAL_FLOW(
+        label = "WinFG 1.0 (Windowed Optical Flow)",
+        code = 1,
+        description = "Open Windowed Frame Generation: Lucas-Kanade spatial-temporal gradient optical flow with bidirectional motion vector warping (60Hz → 120Hz/240Hz)"
+    ),
+    AMD_FSR3_FMMF(
+        label = "AMD FSR 3 Open FMMF (Fluid Motion)",
+        code = 2,
+        description = "Open FidelityFX Fluid Motion Interpolation: Luma pyramid motion estimation + disocclusion fallback & static HUD protection"
+    ),
+    RIFE_LITE_SHADER(
+        label = "RIFE-Lite Real-Time Flow (IFNet Shader)",
+        code = 3,
+        description = "Real-Time Intermediate Flow Estimation shader: Multi-scale coarse-to-fine flow warping with confidence blending"
+    ),
+    SGSR_2_TEMPORAL(
+        label = "Snapdragon GSR 2 Temporal Motion",
+        code = 4,
+        description = "Mobile-optimized Adreno temporal motion vector synthesis + neighborhood variance clamping (YCoCg anti-ghosting)"
+    ),
+    SVP_MEMC_BLOCK(
+        label = "OpenMEMC / SVP 8-Tap Block Search",
+        code = 5,
+        description = "Diamond 8-direction Sum of Absolute Differences (SAD) block motion compensation for ultra-smooth 24/30/60fps video"
+    )
+}
+
+/**
+ * Target frame multiplier when Frame Generation is enabled.
+ */
+enum class FrameGenMultiplier(val label: String, val factor: Int) {
+    AUTO_DISPLAY_HZ("Auto Match Screen Hz", 0),
+    DOUBLE_2X("2× FPS (e.g. 60 → 120Hz)", 2),
+    TRIPLE_3X("3× FPS (e.g. 60 → 180Hz)", 3),
+    QUAD_4X("4× FPS (e.g. 60 → 240Hz)", 4)
+}
+
 enum class ColorSpaceMode(val label: String, val code: Int) {
     REC_709("Rec.709 (HD Studio)", 0),
     REC_601("Rec.601 (SD / Legacy)", 1),
@@ -292,13 +342,18 @@ enum class ColorSpaceMode(val label: String, val code: Int) {
 }
 
 /**
- * Hardware-accelerated GPU shader, backend & viewport configuration.
+ * Hardware-accelerated GPU shader, backend, upscaler, frame generation & viewport configuration.
  * Defaults to VULKAN backend, STRETCH_FILL fullscreen, and LINEAR filtering.
  */
 data class RenderConfig(
     val graphicsBackend: GraphicsBackend = GraphicsBackend.VULKAN,
     val aspectRatioPreset: AspectRatioPreset = AspectRatioPreset.STRETCH_FILL,
     val filteringMode: TextureFilteringMode = TextureFilteringMode.LINEAR,
+    val frameGenMode: FrameGenMode = FrameGenMode.OFF,
+    val frameGenMultiplier: FrameGenMultiplier = FrameGenMultiplier.AUTO_DISPLAY_HZ,
+    val frameGenMotionScale: Float = 1.0f,       // 0.25 to 2.0 optical flow vector strength
+    val frameGenAntiGhosting: Float = 0.75f,     // 0.0 to 1.0 disocclusion / YCoCg variance clamp
+    val frameGenUiProtection: Boolean = true,    // Protects static HUDs / crosshairs / text from warping
     val colorSpace: ColorSpaceMode = ColorSpaceMode.REC_709,
     val fullRangeRgb: Boolean = true,
     val brightness: Float = 0.0f,     // -0.5 to +0.5
@@ -332,10 +387,12 @@ data class HostDisplayInfo(
 }
 
 /**
- * Live telemetry metrics from the Vulkan / OpenGL ES render pipeline & capture engine.
+ * Live telemetry metrics from the Vulkan / OpenGL ES render pipeline, upscaler & frame generator.
  */
 data class StreamTelemetry(
     val currentFps: Float = 0f,
+    val outputPresentedFps: Float = 0f,
+    val generatedFramesPerSec: Float = 0f,
     val frameTimeMs: Float = 0f,
     val estimatedBitrateMbps: Float = 0f,
     val droppedFrames: Long = 0L,

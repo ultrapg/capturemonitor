@@ -6,11 +6,20 @@ Built as a clean, zero-bloat, open-source alternative to apps like **Noir**, wit
 
 ---
 
-## Key Features (v0.4.0)
+## Key Features (v0.5.0)
 
+- **Open Frame Generation & Motion Interpolation Suite (Ping-Pong Temporal FBO Pipeline)**:
+  - Captures every incoming UVC frame into a dual-frame ping-pong `GL_TEXTURE_2D` FBO ring (`sPrevTex` + `sCurrTex`) to synthesize intermediate sub-frames at the Android display's native refresh rate (`90Hz`, `120Hz`, `144Hz`, `240Hz`):
+  - **WinFG 1.0 (Open Windowed Optical Flow)**: Bidirectional spatial-temporal Lucas-Kanade optical flow estimation with motion-vector warping and disocclusion clamping
+  - **AMD FSR 3 Open Fluid Motion (FMMF)**: Coarse + fine pyramid optical flow search with game-motion luminance weighting and non-linear confidence blending
+  - **RIFE-Lite Flow (Real-Time Intermediate Flow)**: Two-stage coarse-to-fine intermediate flow estimation with bidirectional residual warping
+  - **Snapdragon GSR 2 Temporal (Adreno Motion)**: Mobile tile-cache-optimized green-channel luma gradient motion vectors with temporal neighborhood clamping
+  - **OpenMEMC / SVP 8-Tap Block Search**: 8-direction Diamond Sum-of-Absolute-Differences (SAD) block matching with sub-pixel refinement
+  - **Full FrameGen Controls**: Target Frame Rate Multiplier (`Auto Display Hz`, `2×`, `3×`, `4×`), Motion Vector Search Scale (`0.25×` to `2.50×`), Disocclusion & Anti-Ghosting (`0%` to `100%`), and Static HUD / Crosshair / Text Edge Protection.
 - **Vulkan 1.3 & OpenGL ES 3.0 Hardware Backend Switcher (Vulkan Default)**:
-  - Defaults to **Vulkan 1.3 (`Vulkan 1.3 Hardware Compute + AHardwareBuffer Zero-Copy`)** for low-overhead hardware acceleration across all modern GPUs, with instant one-tap switching between **Vulkan 1.3** and **OpenGL ES 3.0**.
+  - Defaults to **Vulkan 1.3 (`Vulkan 1.3 Hardware Compute + AHardwareBuffer Zero-Copy + AGSL SPIR-V RenderEffect`)** on Android 13+ (SkiaVk RenderThread) for low-overhead hardware acceleration across all modern GPUs, with instant one-tap switching between **Vulkan 1.3** and **OpenGL ES 3.0**.
 - **Comprehensive Hardware Upscaling & Super Resolution Suite (`Linear` Default)**:
+  - All 11 spatial upscalers sample directly through the temporal FrameGen reconstruction pipeline:
   - **Linear** (Default hardware linear texture filtering)
   - **AMD FSR 1.0 (EASU + RCAS)**: 12-tap Edge-Adaptive Spatial Upsampling + Robust Contrast-Adaptive Sharpening
   - **AMD FSR 1.1 Ultra-Quality (Anti-Ringing)**: Enhanced FSR spatial reconstruction with neighborhood clamping
