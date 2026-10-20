@@ -341,19 +341,21 @@ class MonitorViewModel(application: Application) : AndroidViewModel(application)
         _uiState.update { it.copy(isAudioMuted = nextMute) }
     }
 
-    fun onRendererTelemetry(fps: Float, frameTimeMs: Float, isReceivingLiveFrames: Boolean) {
+    fun onRendererTelemetry(fps: Float, frameTimeMs: Float, isReceivingLiveFrames: Boolean, gpuHardwareName: String) {
         _uiState.update { state ->
             val bitrate = if (state.isCaptureCardConnected || state.renderConfig.showTestPatternWhenNoSignal) {
                 state.selectedMode.requiredMbps.toFloat()
             } else {
                 0f
             }
+            val cfg = state.renderConfig
             state.copy(
                 isReceivingLiveFrames = isReceivingLiveFrames,
                 telemetry = state.telemetry.copy(
                     currentFps = fps,
                     frameTimeMs = frameTimeMs,
-                    estimatedBitrateMbps = bitrate
+                    estimatedBitrateMbps = bitrate,
+                    activeEngineName = "${cfg.graphicsBackend.label} • $gpuHardwareName • ${cfg.filteringMode.label}"
                 )
             )
         }

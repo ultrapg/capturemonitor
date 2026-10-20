@@ -237,8 +237,8 @@ fun CaptureMonitorScreen(
                     val renderer = HardwareVideoRenderer(
                         context = ctx,
                         glSurfaceView = this,
-                        onTelemetryTick = { fps, frameMs, isLive ->
-                            viewModel.onRendererTelemetry(fps, frameMs, isLive)
+                        onTelemetryTick = { fps, frameMs, isLive, gpuName ->
+                            viewModel.onRendererTelemetry(fps, frameMs, isLive, gpuName)
                         }
                     )
                     renderer.updateRenderConfig(state.renderConfig)
