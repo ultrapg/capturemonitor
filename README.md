@@ -6,6 +6,15 @@ Built as a clean, zero-bloat, open-source alternative to apps like **Noir**, wit
 
 ---
 
+## What's new in v0.6.1
+
+- **Default 1080p @ 30 FPS (`1920×1080 @ 30Hz MJPEG`)**: Defaults out-of-the-box to 1080p @ 30 FPS for universal plug-and-play compatibility across all USB 2.0 and USB 3.0 HDMI capture cards while keeping all other default settings intact.
+- **Fixed Black Screen / Display Output Pipeline**:
+  - Removed the `SurfaceView` `RenderEffect` layer that intercepted the `GLSurfaceView` window hole-punch and turned it opaque black.
+  - Restored the direct zero-copy `GL_TEXTURE_EXTERNAL_OES` upscaling shader path when Frame Generation is off, and separated Frame Generation (`frameGenProgram`) and Spatial Upscaling (`tex2dUpscaleProgram`) into distinct passes so mobile GPU shader compilers never fail due to function-inlining limits.
+  - Fixed a race condition between `onSurfaceCreated` and `bindSource` that could stop the Camera2 session immediately after opening it.
+  - Improved UVC Camera2 session startup (`TEMPLATE_PREVIEW` + flexible FPS range + 3-tier automatic fallback) and external UVC camera ID matching.
+
 ## What's new in v0.6.0
 
 - **Reliable "No Signal"**: a connected card with no HDMI source now shows a clear No Signal screen (frame watchdog + blank/solid-blue feed detection, toggleable), and video returns automatically when a source is connected.

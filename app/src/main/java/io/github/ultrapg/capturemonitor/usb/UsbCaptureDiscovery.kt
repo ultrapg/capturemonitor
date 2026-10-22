@@ -110,6 +110,9 @@ class UsbCaptureDiscovery(
     /** USB devices we already showed a permission dialog for (prevents dialog spam while re-scanning). */
     private val permissionRequestedFor = mutableSetOf<String>()
 
+    /** Camera IDs observed when no USB video device was plugged in (internal phone cameras). */
+    private val baselineInternalCameraIds = mutableSetOf<String>()
+
     private val usbReceiver = object : BroadcastReceiver() {
         override fun onReceive(ctx: Context, intent: Intent) {
             when (intent.action) {
@@ -202,15 +205,33 @@ class UsbCaptureDiscovery(
     fun discoverCaptureDevices(): List<CaptureDeviceInfo> {
         val discovered = mutableListOf<CaptureDeviceInfo>()
 
-        // 1. Inspect external UVC Camera2 devices exposed by the Android kernel
+        // 1. Inspect physically connected USB devices via UsbManager first
+        val usbDevices = usbManager.deviceList.values.toList()
+        val videoUsbDevices = usbDevices.filter { isVideoCaptureUsbDevice(it) }
+        // Forget unplugged devices so re-plugging prompts again
+        permissionRequestedFor.retainAll(usbDevices.map { it.deviceName }.toSet())
+
+        // 2. Inspect external UVC Camera2 devices exposed by the Android kernel
         val externalCameraIds = mutableListOf<String>()
         val allCameraIds = mutableListOf<String>()
+        val physicalSubCameraIds = mutableSetOf<String>()
         try {
             for (camId in cameraManager.cameraIdList) {
                 allCameraIds.add(camId)
                 val chars = cameraManager.getCameraCharacteristics(camId)
                 val facing = chars.get(CameraCharacteristics.LENS_FACING)
-                if (facing == CameraCharacteristics.LENS_FACING_EXTERNAL) {
+                val hwLevel = chars.get(CameraCharacteristics.INFO_SUPPORTED_HARDWARE_LEVEL)
+                val isExternalHwLevel = Build.VERSION.SDK_INT >= Build.VERSION_CODES.P &&
+                    hwLevel == CameraCharacteristics.INFO_SUPPORTED_HARDWARE_LEVEL_EXTERNAL
+
+                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.P) {
+                    try {
+                        physicalSubCameraIds.addAll(chars.physicalCameraIds)
+                    } catch (_: Exception) {
+                    }
+                }
+
+                if (facing == CameraCharacteristics.LENS_FACING_EXTERNAL || isExternalHwLevel || facing == null) {
                     externalCameraIds.add(camId)
                 }
             }
@@ -218,51 +239,57 @@ class UsbCaptureDiscovery(
             Log.w(TAG, "Unable to query Camera2 characteristics: ${e.message}")
         }
 
-        // 2. Inspect physically connected USB devices via UsbManager
-        val usbDevices = usbManager.deviceList.values.toList()
-        // Forget unplugged devices so re-plugging prompts again
-        permissionRequestedFor.retainAll(usbDevices.map { it.deviceName }.toSet())
-        for (usbDevice in usbDevices) {
-            if (isVideoCaptureUsbDevice(usbDevice)) {
-                val hasPerm = usbManager.hasPermission(usbDevice)
-                if (!hasPerm) {
-                    // Proactively request USB permission once per plug-in
-                    try {
-                        if (permissionRequestedFor.add(usbDevice.deviceName)) requestUsbPermission(usbDevice)
-                    } catch (_: Exception) {
-                    }
+        if (videoUsbDevices.isEmpty() && externalCameraIds.isEmpty()) {
+            baselineInternalCameraIds.addAll(allCameraIds)
+        }
+
+        for (usbDevice in videoUsbDevices) {
+            val hasPerm = usbManager.hasPermission(usbDevice)
+            if (!hasPerm) {
+                // Proactively request USB permission once per plug-in
+                try {
+                    if (permissionRequestedFor.add(usbDevice.deviceName)) requestUsbPermission(usbDevice)
+                } catch (_: Exception) {
                 }
-                val vendor = CaptureCardVendor.fromVendorId(usbDevice.vendorId)
-                val (usbStd, bcdVerStr, parsedModes) = inspectUsbDeviceDescriptors(usbDevice)
-                // Match with an external camera ID if available, or highest-indexed camera added on USB hotplug
-                val matchedCameraId = externalCameraIds.firstOrNull()
-                    ?: allCameraIds.firstOrNull { id -> id.toIntOrNull()?.let { it >= 2 } == true }
-
-                val productName = buildDeviceTitle(usbDevice, vendor)
-                val combinedModes = mergeModesWithAllQualities(parsedModes, queryCameraModes(matchedCameraId))
-
-                discovered.add(
-                    CaptureDeviceInfo(
-                        id = "usb_${usbDevice.deviceId}",
-                        name = productName,
-                        vendorId = usbDevice.vendorId,
-                        productId = usbDevice.productId,
-                        vendor = vendor,
-                        usbStandard = usbStd,
-                        usbVersionString = bcdVerStr,
-                        camera2Id = matchedCameraId,
-                        usbDeviceName = usbDevice.deviceName,
-                        supportedModes = combinedModes,
-                        isSimulated = false,
-                        hasUsbPermission = hasPerm,
-                        serialNumber = try {
-                            if (hasPerm) usbDevice.serialNumber else null
-                        } catch (_: Exception) {
-                            null
-                        }
-                    )
-                )
             }
+            val vendor = CaptureCardVendor.fromVendorId(usbDevice.vendorId)
+            val (usbStd, bcdVerStr, parsedModes) = inspectUsbDeviceDescriptors(usbDevice)
+
+            // Match with a genuine external camera ID, or a newly hotplugged camera ID not part of internal multi-cam
+            val nonInternalCandidates = allCameraIds.filter { id ->
+                id != "0" && id != "1" && !physicalSubCameraIds.contains(id) && !baselineInternalCameraIds.contains(id)
+            }
+            val fallbackCandidates = allCameraIds.filter { id ->
+                id != "0" && id != "1" && !physicalSubCameraIds.contains(id)
+            }
+            val matchedCameraId = externalCameraIds.firstOrNull()
+                ?: nonInternalCandidates.lastOrNull()
+                ?: fallbackCandidates.lastOrNull()
+
+            val productName = buildDeviceTitle(usbDevice, vendor)
+            val combinedModes = mergeModesWithAllQualities(parsedModes, queryCameraModes(matchedCameraId))
+
+            discovered.add(
+                CaptureDeviceInfo(
+                    id = "usb_${usbDevice.deviceId}",
+                    name = productName,
+                    vendorId = usbDevice.vendorId,
+                    productId = usbDevice.productId,
+                    vendor = vendor,
+                    usbStandard = usbStd,
+                    usbVersionString = bcdVerStr,
+                    camera2Id = matchedCameraId,
+                    usbDeviceName = usbDevice.deviceName,
+                    supportedModes = combinedModes,
+                    isSimulated = false,
+                    hasUsbPermission = hasPerm,
+                    serialNumber = try {
+                        if (hasPerm) usbDevice.serialNumber else null
+                    } catch (_: Exception) {
+                        null
+                    }
+                )
+            )
         }
 
         // 3. If Android exposes an EXTERNAL Camera2 device that wasn't already matched in UsbManager
@@ -292,45 +319,26 @@ class UsbCaptureDiscovery(
     }
 
     /**
-     * Selects the highest resolution and refresh rate (90Hz / 120Hz / 144Hz / 240Hz) supported by
-     * BOTH the Android device's screen and the connected capture card.
+     * Selects the reliable default mode of 1920×1080 @ 30fps (MJPEG) so every USB 2.0 / 3.0
+     * capture card starts streaming immediately out-of-the-box without exceeding USB bandwidth
+     * or stalling UVC negotiation. Users can freely switch to 60/120/240Hz or 4K in the drawer.
      */
     fun selectBestDefaultMode(
         device: CaptureDeviceInfo?,
-        hostDisplay: HostDisplayInfo
+        @Suppress("UNUSED_PARAMETER") hostDisplay: HostDisplayInfo
     ): VideoMode {
         val candidates = device?.supportedModes?.filter { it.format == VideoFormat.MJPEG }
             ?.takeIf { it.isNotEmpty() }
             ?: ALL_STANDARD_MODES.filter { it.format == VideoFormat.MJPEG }
 
-        val targetW = hostDisplay.physicalWidth.coerceIn(1280, 3840)
-        val targetH = hostDisplay.physicalHeight.coerceIn(720, 2160)
-        val targetPixels = targetW.toLong() * targetH.toLong()
-        val targetHz = hostDisplay.maxRefreshRateHz.coerceIn(60, 240)
-        val usbStd = device?.usbStandard ?: UsbStandard.USB_3_0_GEN1
-
-        // Prefer the highest refresh rate up to the display's native max Hz (e.g. 90Hz, 120Hz, 144Hz, 240Hz)
-        // and the highest resolution up to the display's physical resolution that fits USB bandwidth.
-        return candidates.maxWithOrNull(
-            compareBy<VideoMode> { mode ->
-                !mode.exceedsUsbBandwidth(usbStd)
-            }.thenBy { mode ->
-                // Exact or highest refresh rate up to the display's max refresh rate (90Hz / 120Hz / 144Hz)
-                if (mode.fps <= targetHz) mode.fps else (targetHz - abs(mode.fps - targetHz)).coerceAtLeast(1)
-            }.thenBy { mode ->
-                val modePixels = mode.width.toLong() * mode.height.toLong()
-                if (modePixels <= targetPixels) {
-                    modePixels
-                } else {
-                    targetPixels - (modePixels - targetPixels) / 2
-                }
-            }
-        ) ?: VideoMode(
-            width = targetW,
-            height = targetH,
-            fps = targetHz,
-            format = VideoFormat.MJPEG
-        )
+        return candidates.firstOrNull { it.width == 1920 && it.height == 1080 && it.fps == 30 }
+            ?: candidates.firstOrNull { it.width == 1920 && it.height == 1080 }
+            ?: VideoMode(
+                width = 1920,
+                height = 1080,
+                fps = 30,
+                format = VideoFormat.MJPEG
+            )
     }
 
     private fun buildDeviceTitle(usbDevice: UsbDevice, vendor: CaptureCardVendor): String {

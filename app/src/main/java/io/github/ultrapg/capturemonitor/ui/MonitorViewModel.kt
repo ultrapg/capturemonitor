@@ -22,7 +22,7 @@ data class MonitorUiState(
     val devices: List<CaptureDeviceInfo> = emptyList(),
     val selectedDevice: CaptureDeviceInfo? = null,
     val hostDisplay: HostDisplayInfo = HostDisplayInfo(3840, 2160, 120, listOf(60, 90, 120)),
-    val selectedMode: VideoMode = VideoMode(1920, 1080, 60, VideoFormat.MJPEG),
+    val selectedMode: VideoMode = VideoMode(1920, 1080, 30, VideoFormat.MJPEG),
     val customModes: List<VideoMode> = emptyList(),
     val simulatedUsbPortStandard: UsbStandard? = null,
     val forceBypassUsbLimits: Boolean = false,

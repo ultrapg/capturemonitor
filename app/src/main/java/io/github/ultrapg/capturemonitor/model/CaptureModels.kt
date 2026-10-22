@@ -370,7 +370,7 @@ data class RenderConfig(
     val overscanCropPercent: Float = 0.0f, // 0% to 10% edge crop for HDMI blanking intervals
     val showSafeAreaGrid: Boolean = false,
     val showTestPatternWhenNoSignal: Boolean = false,
-    val autoDetectBlankSignal: Boolean = true, // Treat a black / solid-blue "no HDMI" feed from the card as No Signal
+    val autoDetectBlankSignal: Boolean = false, // Optional: treat uniform black/blue frame as No Signal
     val ultraLowLatencyMode: Boolean = true
 )
 

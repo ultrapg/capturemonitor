@@ -4,6 +4,7 @@ import android.annotation.SuppressLint
 import android.content.Context
 import android.graphics.SurfaceTexture
 import android.hardware.camera2.CameraCaptureSession
+import android.hardware.camera2.CameraCharacteristics
 import android.hardware.camera2.CameraDevice
 import android.hardware.camera2.CameraManager
 import android.hardware.camera2.CaptureRequest
@@ -17,8 +18,6 @@ import android.os.Looper
 import android.util.Log
 import android.util.Range
 import android.util.Size
-import android.hardware.camera2.CameraCharacteristics
-import java.util.concurrent.atomic.AtomicBoolean
 import android.view.Surface
 import io.github.ultrapg.capturemonitor.model.AspectRatioPreset
 import io.github.ultrapg.capturemonitor.model.FrameGenMode
@@ -31,33 +30,30 @@ import java.nio.ByteOrder
 import java.nio.FloatBuffer
 import javax.microedition.khronos.egl.EGLConfig
 import javax.microedition.khronos.opengles.GL10
+import kotlin.math.abs
 import kotlin.math.max
 import kotlin.math.min
 
 /**
- * Multi-Pass Hardware GPU Video Renderer with:
+ * High-Reliability Hardware GPU Video Renderer for USB / USB-C HDMI Capture Cards.
  *
- * 1. **Dual Ping-Pong FBO Temporal History Ring (`historyFboId[0]`, `historyFboId[1]`)**:
- *    Stores frame $T-1$ (`prevTexId`) and frame $T$ (`currTexId`) so real-time Optical Flow Frame Generation
- *    and sub-pixel spatial upscaling work on BOTH live USB capture card streams (`GL_TEXTURE_EXTERNAL_OES`)
- *    and the built-in Calibration Test Pattern.
- *
- * 2. **5 Open-Source Frame Generation (Motion Interpolation) Shaders**:
- *    - `WinFG 1.0 (Windowed Optical Flow)`: Lucas-Kanade spatial-temporal gradient optical flow $(I_x, I_y, I_t)$
- *      with bidirectional motion vector warping ($t \in (0, 1)$).
- *    - `AMD FSR 3 Open FMMF (Fluid Motion Interpolation)`: Luma-gradient motion vector estimation with
- *      disocclusion detection and static UI / crosshair protection.
- *    - `RIFE-Lite Real-Time Flow (IFNet Shader)`: Coarse-to-fine multi-scale bidirectional flow warping
- *      with occlusion confidence weighting.
- *    - `Snapdragon GSR 2 Temporal Motion`: Mobile Adreno temporal motion vector synthesis with YCoCg neighborhood
- *      variance clamping (anti-ghosting).
- *    - `OpenMEMC / SVP 8-Tap Block Search`: 8-direction Diamond Sum of Absolute Differences (SAD) block
- *      matching motion compensation.
- *
- * 3. **11 True Sub-Pixel Spatial Upscaling Shaders**:
- *    - `Linear` (Default), `AMD FSR 1.0 (EASU + RCAS)`, `AMD FSR 1.1 Ultra-Quality`, `AMD FidelityFX CAS / RCAS`,
- *      `NVIDIA Image Scaling (NIS)`, `Snapdragon GSR`, `Intel XeSS Spatial`, `Lanczos-3 Windowed Sinc`,
- *      `Catmull-Rom Bicubic`, `Anime4K Fast Line-Art`, and `Pixel-Perfect Integer`.
+ * Architecture highlights:
+ * 1. **Zero-Copy Direct OES Path (`oesUpscaleProgram`)**:
+ *    When Frame Generation is OFF (default), renders directly from `GL_TEXTURE_EXTERNAL_OES`
+ *    to the screen backbuffer in a single pass with zero intermediate FBO overhead.
+ * 2. **Decoupled Multi-Pass Frame Generation + Spatial Upscaling**:
+ *    When Frame Generation (`WinFG 1.0`, `AMD FSR 3 Open FMMF`, `RIFE-Lite`, `Snapdragon GSR 2`,
+ *    `OpenMEMC / SVP`) is enabled:
+ *    - Pass 1 (`oesToFboProgram`): Captures the incoming OES frame into a dual ping-pong 2D FBO ring.
+ *    - Pass 2 (`frameGenProgram`): Synthesizes the motion-interpolated intermediate frame into `fgOutputFboId`.
+ *    - Pass 3 (`tex2dUpscaleProgram`): Applies the selected spatial upscaler (`Linear`, `AMD FSR 1.0`,
+ *      `AMD FSR 1.1 Ultra`, `AMD RCAS`, `NVIDIA NIS`, `Snapdragon GSR`, `Intel XeSS Spatial`,
+ *      `Lanczos-3`, `Catmull-Rom`, `Anime4K`, `Pixel-Perfect Integer`) and color grading to the screen.
+ *    Separating FrameGen and Upscaling prevents shader instruction-inlining bloat and guarantees 100%
+ *    shader compilation compatibility across all Adreno, Mali, PowerVR, and Xclipse mobile GPUs.
+ * 3. **Automatic Multi-Tier UVC Stream Negotiation & Watchdog**:
+ *    Defaults to `1920×1080 @ 30fps` using `TEMPLATE_PREVIEW` with flexible UVC frame intervals,
+ *    and automatically falls back through unconstrained FPS and native capture sizes if a card stalls.
  */
 class HardwareVideoRenderer(
     private val context: Context,
@@ -91,7 +87,7 @@ class HardwareVideoRenderer(
             }
         """
 
-        // Pass 1A: Copy external OES capture card frame into the current 2D history FBO slot
+        // Simple, rock-solid OES copy shader (also serves as failsafe direct renderer)
         private const val FRAGMENT_SHADER_OES_TO_FBO = """
             #extension GL_OES_EGL_image_external : require
             precision highp float;
@@ -102,7 +98,7 @@ class HardwareVideoRenderer(
             }
         """
 
-        // Pass 1B: Render procedural calibration test pattern into the current 2D history FBO slot
+        // Procedural SMPTE Calibration Test Pattern rendered into 2D FBO when enabled
         private const val FRAGMENT_SHADER_PATTERN_TO_FBO = """
             precision highp float;
             varying vec2 vRawUv;
@@ -132,7 +128,6 @@ class HardwareVideoRenderer(
                     float diag = step(0.5, fract((uv.x * 48.0) + (uv.y * 27.0)));
                     col = mix(vec3(0.08, 0.11, 0.16), vec3(0.92, 0.96, 1.0), diag);
                 } else if (uv.y < 0.86) {
-                    // Moving motion pendulum bar so Frame Generation optical flow can be tested visually!
                     float sweep = fract(uTime * 0.55);
                     float dist = abs(uv.x - sweep);
                     float grid = step(0.985, fract(uv.x * 32.0));
@@ -152,43 +147,45 @@ class HardwareVideoRenderer(
             }
         """
 
-        // Pass 2: Combined Optical Flow Frame Generation (WinFG, FSR3 FMMF, RIFE-Lite, SGSR2, OpenMEMC)
-        // + Sub-Pixel Spatial Upscaling (FSR 1.0 EASU+RCAS, FSR 1.1 Ultra, NIS, Snapdragon GSR, XeSS, Lanczos-3, Catmull-Rom, Anime4K)
-        private val FRAGMENT_SHADER_COMPOSITE_FG_AND_UPSCALE = """
+        // Standalone Frame Generation shader (Pass 2 when FrameGen != OFF).
+        // Unrolls all 8 diamond block-matching taps without dynamic array indexing for 100% GLSL ES 1.00 compatibility.
+        private const val FRAGMENT_SHADER_FRAME_GEN_FBO = """
             precision highp float;
             varying vec2 vTexCoord;
-            varying vec2 vRawUv;
             uniform sampler2D sCurrTex;
             uniform sampler2D sPrevTex;
             uniform vec2 uTexelSize;
-            uniform vec2 uSourceSize;
-            uniform int uUpscalerMode;
             uniform int uFrameGenMode;
-            uniform float uFrameGenPhase;       // 0.0 = latest real frame, (0..1) = interpolated intermediate frame
-            uniform float uMotionScale;         // 0.25 .. 2.0
-            uniform float uAntiGhosting;        // 0.0 .. 1.0
-            uniform int uUiProtection;          // 1 = protect static UI / HUD elements
-            uniform float uBrightness;
-            uniform float uContrast;
-            uniform float uSaturation;
-            uniform float uGamma;
-            uniform float uSharpness;
-            uniform int uFullRange;
-            uniform int uColorSpace;
-            uniform int uShowGrid;
+            uniform float uFrameGenPhase;
+            uniform float uMotionScale;
+            uniform float uAntiGhosting;
+            uniform int uUiProtection;
 
             float luma(vec3 c) {
                 return dot(c, vec3(0.299, 0.587, 0.114));
             }
 
-            // ============================================================================
-            // OPEN-SOURCE FRAME GENERATION / MOTION INTERPOLATION ENGINE
-            // Evaluates frame(t) between sPrevTex (t=0) and sCurrTex (t=1) at uv
-            // ============================================================================
-            vec3 sampleFrameGen(vec2 uv) {
+            void testDiamondCandidate(
+                vec2 uv,
+                vec2 candOffset,
+                inout float minSad,
+                inout vec2 bestOffset
+            ) {
+                float lPrevOff = luma(texture2D(sPrevTex, uv - candOffset * 0.5).rgb);
+                float lCurrOff = luma(texture2D(sCurrTex, uv + candOffset * 0.5).rgb);
+                float sad = abs(lCurrOff - lPrevOff);
+                if (sad < minSad) {
+                    minSad = sad;
+                    bestOffset = candOffset;
+                }
+            }
+
+            void main() {
+                vec2 uv = vTexCoord;
                 vec3 curr = texture2D(sCurrTex, uv).rgb;
                 if (uFrameGenMode == 0 || uFrameGenPhase >= 0.98) {
-                    return curr;
+                    gl_FragColor = vec4(curr, 1.0);
+                    return;
                 }
                 vec3 prev = texture2D(sPrevTex, uv).rgb;
                 float phase = clamp(uFrameGenPhase, 0.05, 0.95);
@@ -196,7 +193,6 @@ class HardwareVideoRenderer(
                 vec2 dx = vec2(uTexelSize.x, 0.0);
                 vec2 dy = vec2(0.0, uTexelSize.y);
 
-                // Neighbor samples in current & previous frames
                 vec3 cN = texture2D(sCurrTex, uv - dy).rgb;
                 vec3 cS = texture2D(sCurrTex, uv + dy).rgb;
                 vec3 cW = texture2D(sCurrTex, uv - dx).rgb;
@@ -211,39 +207,34 @@ class HardwareVideoRenderer(
                 float lp = luma(prev);
                 float it = lc - lp;
 
-                // Static HUD / Crosshair / Text Protection:
-                // High spatial edge contrast with near-zero temporal luma change stays locked to curr
                 float spatialEdge = abs(luma(cE) - luma(cW)) + abs(luma(cS) - luma(cN));
                 if (uUiProtection == 1 && abs(it) < 0.008 && spatialEdge > 0.25) {
-                    return curr;
+                    gl_FragColor = vec4(curr, 1.0);
+                    return;
                 }
 
-                // Spatial gradients Ix, Iy averaged across prev & curr
                 float ix = ((luma(cE) - luma(cW)) + (luma(pE) - luma(pW))) * 0.25;
                 float iy = ((luma(cS) - luma(cN)) + (luma(pS) - luma(pN))) * 0.25;
-
                 vec2 flowUv = vec2(0.0);
 
                 if (uFrameGenMode == 1) {
-                    // 1. WinFG 1.0 (Windowed Optical Flow — Lucas-Kanade regularized gradient flow)
+                    // WinFG 1.0 (Windowed Optical Flow)
                     float denom = ix * ix + iy * iy + 0.0035;
                     vec2 v = -it * vec2(ix, iy) / denom;
                     flowUv = clamp(v * uMotionScale * 2.5, vec2(-4.0), vec2(4.0)) * uTexelSize;
                 } else if (uFrameGenMode == 2) {
-                    // 2. AMD FSR 3 Open FMMF (Fluid Motion Interpolation with coarse + fine luma pyramid)
+                    // AMD FSR 3 Open FMMF (Fluid Motion)
                     vec3 cE2 = texture2D(sCurrTex, uv + 2.0 * dx).rgb;
                     vec3 cW2 = texture2D(sCurrTex, uv - 2.0 * dx).rgb;
                     vec3 cS2 = texture2D(sCurrTex, uv + 2.0 * dy).rgb;
                     vec3 cN2 = texture2D(sCurrTex, uv - 2.0 * dy).rgb;
-                    float ixCoarse = (luma(cE2) - luma(cW2)) * 0.25;
-                    float iyCoarse = (luma(cS2) - luma(cN2)) * 0.25;
-                    float gx = mix(ix, ixCoarse, 0.45);
-                    float gy = mix(iy, iyCoarse, 0.45);
+                    float gx = mix(ix, (luma(cE2) - luma(cW2)) * 0.25, 0.45);
+                    float gy = mix(iy, (luma(cS2) - luma(cN2)) * 0.25, 0.45);
                     float denom = gx * gx + gy * gy + 0.0030;
                     vec2 v = -it * vec2(gx, gy) / denom;
                     flowUv = clamp(v * uMotionScale * 3.0, vec2(-5.0), vec2(5.0)) * uTexelSize;
                 } else if (uFrameGenMode == 3) {
-                    // 3. RIFE-Lite Real-Time Flow (Coarse-to-Fine IFNet-style multi-scale flow refinement)
+                    // RIFE-Lite Real-Time Flow
                     float denom1 = ix * ix + iy * iy + 0.0040;
                     vec2 vCoarse = clamp(-it * vec2(ix, iy) / denom1, vec2(-3.0), vec2(3.0)) * uTexelSize;
                     vec3 warpedPrev = texture2D(sPrevTex, uv - vCoarse * 0.5).rgb;
@@ -252,48 +243,32 @@ class HardwareVideoRenderer(
                     vec2 vFine = clamp(-residualIt * vec2(ix, iy) / denom1, vec2(-2.0), vec2(2.0)) * uTexelSize;
                     flowUv = (vCoarse + vFine) * uMotionScale * 1.6;
                 } else if (uFrameGenMode == 4) {
-                    // 4. Snapdragon GSR 2 Temporal Motion (Adreno green-luma motion vector + variance clamp)
+                    // Snapdragon GSR 2 Temporal Motion
                     float gx = ((cE.g - cW.g) + (pE.g - pW.g)) * 0.25;
                     float gy = ((cS.g - cN.g) + (pS.g - pN.g)) * 0.25;
                     float gt = curr.g - prev.g;
                     float denom = gx * gx + gy * gy + 0.0032;
                     flowUv = clamp((-gt * vec2(gx, gy) / denom) * uMotionScale * 2.6, vec2(-4.0), vec2(4.0)) * uTexelSize;
                 } else if (uFrameGenMode == 5) {
-                    // 5. OpenMEMC / SVP 8-Tap Diamond Block Motion Search (Minimum SAD search)
+                    // OpenMEMC / SVP 8-Tap Diamond Block Search (unrolled for GLES 2.0 compliance)
                     vec2 bestOffset = vec2(0.0);
-                    float minSad = abs(lc - lp) * 0.92; // slight bias toward zero-motion stability
-
-                    vec2 step1 = uTexelSize * (1.25 * uMotionScale);
-                    vec2 candidates[8];
-                    candidates[0] = vec2( step1.x, 0.0);
-                    candidates[1] = vec2(-step1.x, 0.0);
-                    candidates[2] = vec2(0.0,  step1.y);
-                    candidates[3] = vec2(0.0, -step1.y);
-                    candidates[4] = vec2( step1.x,  step1.y);
-                    candidates[5] = vec2(-step1.x,  step1.y);
-                    candidates[6] = vec2( step1.x, -step1.y);
-                    candidates[7] = vec2(-step1.x, -step1.y);
-
-                    for (int k = 0; k < 8; k++) {
-                        vec2 off = candidates[k];
-                        float lPrevOff = luma(texture2D(sPrevTex, uv - off * 0.5).rgb);
-                        float lCurrOff = luma(texture2D(sCurrTex, uv + off * 0.5).rgb);
-                        float sad = abs(lCurrOff - lPrevOff);
-                        if (sad < minSad) {
-                            minSad = sad;
-                            bestOffset = off;
-                        }
-                    }
+                    float minSad = abs(lc - lp) * 0.92;
+                    vec2 s1 = uTexelSize * (1.25 * uMotionScale);
+                    testDiamondCandidate(uv, vec2( s1.x,  0.0), minSad, bestOffset);
+                    testDiamondCandidate(uv, vec2(-s1.x,  0.0), minSad, bestOffset);
+                    testDiamondCandidate(uv, vec2( 0.0,  s1.y), minSad, bestOffset);
+                    testDiamondCandidate(uv, vec2( 0.0, -s1.y), minSad, bestOffset);
+                    testDiamondCandidate(uv, vec2( s1.x,  s1.y), minSad, bestOffset);
+                    testDiamondCandidate(uv, vec2(-s1.x,  s1.y), minSad, bestOffset);
+                    testDiamondCandidate(uv, vec2( s1.x, -s1.y), minSad, bestOffset);
+                    testDiamondCandidate(uv, vec2(-s1.x, -s1.y), minSad, bestOffset);
                     flowUv = bestOffset;
                 }
 
-                // Bidirectional motion-compensated warp along flowUv at fractional timestamp `phase`
                 vec3 warpPrev = texture2D(sPrevTex, uv - flowUv * phase).rgb;
                 vec3 warpCurr = texture2D(sCurrTex, uv + flowUv * (1.0 - phase)).rgb;
                 vec3 mcBlend = mix(warpPrev, warpCurr, phase);
 
-                // Disocclusion & Anti-Ghosting Neighborhood Clamp:
-                // If warped samples disagree strongly (occlusion boundary), blend gracefully toward curr
                 float warpError = length(warpCurr - warpPrev);
                 float confidence = clamp(1.0 - warpError * (1.2 + uAntiGhosting * 2.0), 0.0, 1.0);
 
@@ -302,303 +277,328 @@ class HardwareVideoRenderer(
                 vec3 clampedMc = clamp(mcBlend, minNeigh, maxNeigh);
                 vec3 safeMc = mix(mcBlend, clampedMc, uAntiGhosting);
 
-                return mix(mix(prev, curr, phase), safeMc, confidence);
+                gl_FragColor = vec4(mix(mix(prev, curr, phase), safeMc, confidence), 1.0);
             }
+        """
 
-            // ============================================================================
-            // SUB-PIXEL SPATIAL UPSCALING ENGINE (11 Hardware Upscalers operating on sampleFrameGen)
-            // ============================================================================
-            vec4 cubicCatmullRomWeights(float t) {
-                float t2 = t * t;
-                float t3 = t2 * t;
-                return vec4(
-                    -0.5 * t3 + t2 - 0.5 * t,
-                     1.5 * t3 - 2.5 * t2 + 1.0,
-                    -1.5 * t3 + 2.0 * t2 + 0.5 * t,
-                     0.5 * t3 - 0.5 * t2
-                );
-            }
+        // Shared Spatial Upscaler Shader (built for both direct samplerExternalOES and 2D FBO textures)
+        private fun buildUpscalerFragmentShader(isExternalOes: Boolean): String {
+            val extHeader = if (isExternalOes) "#extension GL_OES_EGL_image_external : require\n" else ""
+            val samplerType = if (isExternalOes) "samplerExternalOES" else "sampler2D"
+            return """
+                $extHeader
+                precision highp float;
+                varying vec2 vTexCoord;
+                varying vec2 vRawUv;
+                uniform $samplerType sTexture;
+                uniform vec2 uTexelSize;
+                uniform vec2 uSourceSize;
+                uniform int uUpscalerMode;
+                uniform float uBrightness;
+                uniform float uContrast;
+                uniform float uSaturation;
+                uniform float uGamma;
+                uniform float uSharpness;
+                uniform int uFullRange;
+                uniform int uColorSpace;
+                uniform int uShowGrid;
 
-            float lanczosWeight(float x, float a) {
-                float ax = abs(x);
-                if (ax < 0.0001) return 1.0;
-                if (ax >= a) return 0.0;
-                float pix = 3.14159265 * x;
-                return (a * sin(pix) * sin(pix / a)) / (pix * pix);
-            }
-
-            vec3 sampleRcas(vec2 uv, vec3 center, float sharpStrength, bool antiRinging) {
-                vec3 n = sampleFrameGen(uv + vec2(0.0, -uTexelSize.y));
-                vec3 s = sampleFrameGen(uv + vec2(0.0,  uTexelSize.y));
-                vec3 w = sampleFrameGen(uv + vec2(-uTexelSize.x, 0.0));
-                vec3 e = sampleFrameGen(uv + vec2( uTexelSize.x, 0.0));
-
-                vec3 min4 = min(min(n, s), min(w, e));
-                vec3 max4 = max(max(n, s), max(w, e));
-                vec3 minAll = min(min4, center);
-                vec3 maxAll = max(max4, center);
-
-                vec3 amp = sqrt(clamp(min(minAll, 1.0 - maxAll) / max(maxAll, vec3(0.0001)), 0.0, 1.0));
-                float peak = -1.0 / mix(8.0, 4.5, clamp(sharpStrength, 0.0, 1.0));
-                vec3 wobe = amp * peak;
-                vec3 res = ((n + s + w + e) * wobe + center) / (1.0 + 4.0 * wobe);
-                if (antiRinging) {
-                    res = clamp(res, minAll, maxAll);
-                }
-                return clamp(res, 0.0, 1.0);
-            }
-
-            vec3 sampleFsr1EasuRcas(vec2 uv, float sharpStrength, bool ultraAntiRinging) {
-                vec2 texPos = uv * uSourceSize - 0.5;
-                vec2 baseTex = (floor(texPos) + 0.5) * uTexelSize;
-                vec2 f = fract(texPos);
-                vec2 dx = vec2(uTexelSize.x, 0.0);
-                vec2 dy = vec2(0.0, uTexelSize.y);
-
-                vec3 f0 = sampleFrameGen(baseTex);
-                vec3 g  = sampleFrameGen(baseTex + dx);
-                vec3 j  = sampleFrameGen(baseTex + dy);
-                vec3 k  = sampleFrameGen(baseTex + dx + dy);
-
-                float lf = luma(f0), lg = luma(g), lj = luma(j), lk = luma(k);
-                float gradX = ((lg - lf) + (lk - lj)) * 0.5;
-                float gradY = ((lj - lf) + (lk - lg)) * 0.5;
-                float gradLen = max(sqrt(gradX * gradX + gradY * gradY), 0.0001);
-                vec2 dir = vec2(-gradY, gradX) / gradLen;
-
-                vec3 bilinear = mix(mix(f0, g, f.x), mix(j, k, f.x), f.y);
-                vec3 tangentA = sampleFrameGen(uv + dir * uTexelSize * 0.45);
-                vec3 tangentB = sampleFrameGen(uv - dir * uTexelSize * 0.45);
-                float edgeAniso = clamp(gradLen * 4.0, 0.0, 1.0);
-                vec3 easu = mix(bilinear, (tangentA + tangentB + bilinear) / 3.0, edgeAniso * 0.65);
-
-                vec3 min4 = min(min(f0, g), min(j, k));
-                vec3 max4 = max(max(f0, g), max(j, k));
-                easu = clamp(easu, min4 * 0.96, max4 * 1.04);
-
-                return sampleRcas(uv, easu, max(sharpStrength, 0.25), ultraAntiRinging);
-            }
-
-            vec3 sampleNvidiaNis(vec2 uv, float sharpStrength) {
-                vec2 texPos = uv * uSourceSize - 0.5;
-                vec2 f = fract(texPos);
-                vec2 dx = vec2(uTexelSize.x, 0.0);
-                vec2 dy = vec2(0.0, uTexelSize.y);
-
-                vec3 c  = sampleFrameGen(uv);
-                vec3 n  = sampleFrameGen(uv - dy);
-                vec3 s  = sampleFrameGen(uv + dy);
-                vec3 w  = sampleFrameGen(uv - dx);
-                vec3 e  = sampleFrameGen(uv + dx);
-                vec3 nw = sampleFrameGen(uv - dx - dy);
-                vec3 ne = sampleFrameGen(uv + dx - dy);
-                vec3 sw = sampleFrameGen(uv - dx + dy);
-                vec3 se = sampleFrameGen(uv + dx + dy);
-
-                float gx = (luma(ne) + 2.0 * luma(e) + luma(se)) - (luma(nw) + 2.0 * luma(w) + luma(sw));
-                float gy = (luma(sw) + 2.0 * luma(s) + luma(se)) - (luma(nw) + 2.0 * luma(n) + luma(ne));
-                float edgeMag = clamp(sqrt(gx * gx + gy * gy), 0.0, 1.0);
-
-                vec4 wx = cubicCatmullRomWeights(f.x);
-                vec4 wy = cubicCatmullRomWeights(f.y);
-                float phaseWeight = clamp(abs(wx.y - wx.z) + abs(wy.y - wy.z), 0.2, 1.0);
-
-                vec3 detail = c - mix((n + s + w + e) * 0.25, (nw + ne + sw + se) * 0.25, 0.35);
-                float nisBoost = mix(1.45, 0.65, edgeMag) * (0.45 + sharpStrength * 1.15) * (0.75 + 0.25 * phaseWeight);
-
-                vec3 minN = min(min(min(n, s), min(w, e)), c);
-                vec3 maxN = max(max(max(n, s), max(w, e)), c);
-                return clamp(c + detail * nisBoost, minN * 0.90, maxN * 1.10);
-            }
-
-            vec3 sampleSnapdragonGsr(vec2 uv, float sharpStrength) {
-                vec2 t = uTexelSize;
-                vec3 c  = sampleFrameGen(uv);
-                vec3 n  = sampleFrameGen(uv + vec2(0.0, -t.y));
-                vec3 s  = sampleFrameGen(uv + vec2(0.0,  t.y));
-                vec3 w  = sampleFrameGen(uv + vec2(-t.x, 0.0));
-                vec3 e  = sampleFrameGen(uv + vec2( t.x, 0.0));
-                vec3 nw = sampleFrameGen(uv + vec2(-t.x, -t.y));
-                vec3 ne = sampleFrameGen(uv + vec2( t.x, -t.y));
-                vec3 sw = sampleFrameGen(uv + vec2(-t.x,  t.y));
-                vec3 se = sampleFrameGen(uv + vec2( t.x,  t.y));
-
-                float dirX = (ne.g + e.g + se.g) - (nw.g + w.g + sw.g);
-                float dirY = (sw.g + s.g + se.g) - (nw.g + n.g + ne.g);
-                float len = max(sqrt(dirX * dirX + dirY * dirY), 0.0001);
-                vec2 isoDir = vec2(-dirY, dirX) / len;
-
-                vec3 isoA = sampleFrameGen(uv + isoDir * t * 0.4);
-                vec3 isoB = sampleFrameGen(uv - isoDir * t * 0.4);
-                vec3 gsrBase = mix(c, (isoA + isoB + c) / 3.0, clamp(len * 2.5, 0.0, 0.6));
-
-                float gw = abs(n.g - s.g) + abs(w.g - e.g);
-                float edgeWeight = clamp(1.0 - gw * 2.0, 0.2, 1.0);
-                vec3 lap = gsrBase * 4.0 - (n + s + w + e);
-                return clamp(gsrBase + lap * ((0.35 + sharpStrength * 0.75) * edgeWeight) * 0.38, 0.0, 1.0);
-            }
-
-            vec3 sampleXessSpatial(vec2 uv, float sharpStrength) {
-                vec2 t = uTexelSize;
-                vec3 c  = sampleFrameGen(uv);
-                vec3 n  = sampleFrameGen(uv + vec2(0.0, -t.y));
-                vec3 s  = sampleFrameGen(uv + vec2(0.0,  t.y));
-                vec3 w  = sampleFrameGen(uv + vec2(-t.x, 0.0));
-                vec3 e  = sampleFrameGen(uv + vec2( t.x, 0.0));
-                vec3 nw = sampleFrameGen(uv + vec2(-t.x, -t.y));
-                vec3 ne = sampleFrameGen(uv + vec2( t.x, -t.y));
-                vec3 sw = sampleFrameGen(uv + vec2(-t.x,  t.y));
-                vec3 se = sampleFrameGen(uv + vec2( t.x,  t.y));
-
-                vec3 box = (n + s + w + e) * 0.15 + (nw + ne + sw + se) * 0.05 + c * 0.20;
-                vec3 minBox = min(min(min(n, s), min(w, e)), c);
-                vec3 maxBox = max(max(max(n, s), max(w, e)), c);
-                return clamp(c + (c - box) * (0.50 + sharpStrength * 0.90), minBox, maxBox);
-            }
-
-            vec3 sampleLanczos3(vec2 uv, float sharpStrength) {
-                vec2 texPos = uv * uSourceSize - 0.5;
-                vec2 baseTex = (floor(texPos) + 0.5) * uTexelSize;
-                vec2 f = fract(texPos);
-
-                vec3 sum = vec3(0.0);
-                float weightSum = 0.0;
-                for (int j = -1; j <= 2; j++) {
-                    float wy = lanczosWeight(float(j) - f.y, 2.0);
-                    for (int i = -1; i <= 2; i++) {
-                        float wx = lanczosWeight(float(i) - f.x, 2.0);
-                        float w = wx * wy;
-                        sum += sampleFrameGen(baseTex + vec2(float(i), float(j)) * uTexelSize) * w;
-                        weightSum += w;
-                    }
-                }
-                vec3 lanczos = sum / max(weightSum, 0.0001);
-                if (sharpStrength > 0.05) {
-                    lanczos = sampleRcas(uv, lanczos, sharpStrength * 0.55, true);
-                }
-                return clamp(lanczos, 0.0, 1.0);
-            }
-
-            vec3 sampleCatmullRom(vec2 uv, float sharpStrength) {
-                vec2 texPos = uv * uSourceSize - 0.5;
-                vec2 baseTex = (floor(texPos) + 0.5) * uTexelSize;
-                vec2 f = fract(texPos);
-
-                vec4 wx = cubicCatmullRomWeights(f.x);
-                vec4 wy = cubicCatmullRomWeights(f.y);
-
-                float w12x = wx.y + wx.z;
-                float w12y = wy.y + wy.z;
-                float off12x = wx.z / max(w12x, 0.0001);
-                float off12y = wy.z / max(w12y, 0.0001);
-
-                vec2 tc0 = baseTex - uTexelSize;
-                vec2 tc3 = baseTex + 2.0 * uTexelSize;
-                vec2 tc12 = baseTex + vec2(off12x, off12y) * uTexelSize;
-
-                vec3 s0 = sampleFrameGen(vec2(tc12.x, tc0.y)) * (w12x * wy.x);
-                vec3 s1 = sampleFrameGen(vec2(tc0.x, tc12.y)) * (wx.x * w12y);
-                vec3 s2 = sampleFrameGen(tc12) * (w12x * w12y);
-                vec3 s3 = sampleFrameGen(vec2(tc3.x, tc12.y)) * (wx.w * w12y);
-                vec3 s4 = sampleFrameGen(vec2(tc12.x, tc3.y)) * (w12x * wy.w);
-
-                float totalW = (w12x * wy.x) + (wx.x * w12y) + (w12x * w12y) + (wx.w * w12y) + (w12x * wy.w);
-                vec3 bicubic = (s0 + s1 + s2 + s3 + s4) / max(totalW, 0.0001);
-                if (sharpStrength > 0.05) {
-                    bicubic = sampleRcas(uv, bicubic, sharpStrength * 0.45, true);
-                }
-                return clamp(bicubic, 0.0, 1.0);
-            }
-
-            vec3 sampleAnime4K(vec2 uv, float sharpStrength) {
-                vec2 t = uTexelSize;
-                vec3 c  = sampleFrameGen(uv);
-                vec3 n  = sampleFrameGen(uv + vec2(0.0, -t.y));
-                vec3 s  = sampleFrameGen(uv + vec2(0.0,  t.y));
-                vec3 w  = sampleFrameGen(uv + vec2(-t.x, 0.0));
-                vec3 e  = sampleFrameGen(uv + vec2( t.x, 0.0));
-                vec3 nw = sampleFrameGen(uv + vec2(-t.x, -t.y));
-                vec3 ne = sampleFrameGen(uv + vec2( t.x, -t.y));
-                vec3 sw = sampleFrameGen(uv + vec2(-t.x,  t.y));
-                vec3 se = sampleFrameGen(uv + vec2( t.x,  t.y));
-
-                vec3 lightest = max(max(max(n, s), max(w, e)), max(max(nw, ne), max(sw, se)));
-                vec3 darkest  = min(min(min(n, s), min(w, e)), min(min(nw, ne), min(sw, se)));
-                float lc = luma(c);
-                float lAvg = (luma(n) + luma(s) + luma(w) + luma(e) + luma(nw) + luma(ne) + luma(sw) + luma(se)) * 0.125;
-                float pushStrength = clamp((0.40 + sharpStrength * 0.60), 0.0, 1.0);
-                return clamp((lc > lAvg) ? mix(c, lightest, pushStrength * 0.55) : mix(c, darkest, pushStrength * 0.55), 0.0, 1.0);
-            }
-
-            vec3 sampleNearestInteger(vec2 uv) {
-                vec2 snappedUv = (floor(uv * uSourceSize) + 0.5) / uSourceSize;
-                return sampleFrameGen(snappedUv);
-            }
-
-            vec3 applyColorGrade(vec3 c) {
-                if (uFullRange == 0) {
-                    c = clamp((c - vec3(0.062745)) * 1.164383, 0.0, 1.0);
-                }
-                c = clamp((c - 0.5) * uContrast + 0.5 + uBrightness, 0.0, 1.0);
-                if (abs(uGamma - 1.0) > 0.01) {
-                    c = pow(c, vec3(1.0 / max(uGamma, 0.2)));
-                }
-                vec3 lumaWeights = (uColorSpace == 1)
-                    ? vec3(0.299, 0.587, 0.114)
-                    : vec3(0.2126, 0.7152, 0.0722);
-                float l = dot(c, lumaWeights);
-                c = mix(vec3(l), c, uSaturation);
-                return clamp(c, 0.0, 1.0);
-            }
-
-            void main() {
-                vec3 center = sampleFrameGen(vTexCoord);
-                vec3 upscaled = center;
-
-                if (uUpscalerMode == 1) {
-                    upscaled = sampleNearestInteger(vTexCoord);
-                } else if (uUpscalerMode == 2) {
-                    upscaled = sampleFsr1EasuRcas(vTexCoord, uSharpness, false);
-                } else if (uUpscalerMode == 3) {
-                    upscaled = sampleFsr1EasuRcas(vTexCoord, uSharpness, true);
-                } else if (uUpscalerMode == 4) {
-                    upscaled = sampleRcas(vTexCoord, center, max(uSharpness, 0.25), true);
-                } else if (uUpscalerMode == 5) {
-                    upscaled = sampleNvidiaNis(vTexCoord, uSharpness);
-                } else if (uUpscalerMode == 6) {
-                    upscaled = sampleSnapdragonGsr(vTexCoord, uSharpness);
-                } else if (uUpscalerMode == 7) {
-                    upscaled = sampleXessSpatial(vTexCoord, uSharpness);
-                } else if (uUpscalerMode == 8) {
-                    upscaled = sampleLanczos3(vTexCoord, uSharpness);
-                } else if (uUpscalerMode == 9) {
-                    upscaled = sampleCatmullRom(vTexCoord, uSharpness);
-                } else if (uUpscalerMode == 10) {
-                    upscaled = sampleAnime4K(vTexCoord, uSharpness);
-                } else {
-                    if (uSharpness > 0.02) {
-                        upscaled = sampleRcas(vTexCoord, center, uSharpness * 0.65, true);
-                    }
+                float luma(vec3 c) {
+                    return dot(c, vec3(0.299, 0.587, 0.114));
                 }
 
-                vec3 graded = applyColorGrade(upscaled);
-                if (uShowGrid == 1) {
-                    bool thirdsX = abs(vRawUv.x - 0.3333) < 0.0018 || abs(vRawUv.x - 0.6667) < 0.0018;
-                    bool thirdsY = abs(vRawUv.y - 0.3333) < 0.0028 || abs(vRawUv.y - 0.6667) < 0.0028;
-                    bool safeBorder = (
-                        (abs(vRawUv.x - 0.05) < 0.0018 || abs(vRawUv.x - 0.95) < 0.0018) && vRawUv.y >= 0.05 && vRawUv.y <= 0.95
-                    ) || (
-                        (abs(vRawUv.y - 0.05) < 0.0028 || abs(vRawUv.y - 0.95) < 0.0028) && vRawUv.x >= 0.05 && vRawUv.x <= 0.95
+                vec4 cubicCatmullRomWeights(float t) {
+                    float t2 = t * t;
+                    float t3 = t2 * t;
+                    return vec4(
+                        -0.5 * t3 + t2 - 0.5 * t,
+                         1.5 * t3 - 2.5 * t2 + 1.0,
+                        -1.5 * t3 + 2.0 * t2 + 0.5 * t,
+                         0.5 * t3 - 0.5 * t2
                     );
-                    if (thirdsX || thirdsY) {
-                        graded = mix(graded, vec3(0.22, 0.74, 0.97), 0.55);
-                    } else if (safeBorder) {
-                        graded = mix(graded, vec3(0.98, 0.75, 0.18), 0.65);
-                    }
                 }
-                gl_FragColor = vec4(graded, 1.0);
-            }
-        """.trimIndent()
+
+                float lanczosWeight(float x, float a) {
+                    float ax = abs(x);
+                    if (ax < 0.0001) return 1.0;
+                    if (ax >= a) return 0.0;
+                    float pix = 3.14159265 * x;
+                    return (a * sin(pix) * sin(pix / a)) / (pix * pix);
+                }
+
+                vec3 sampleRcas(vec2 uv, vec3 center, float sharpStrength, bool antiRinging) {
+                    vec3 n = texture2D(sTexture, uv + vec2(0.0, -uTexelSize.y)).rgb;
+                    vec3 s = texture2D(sTexture, uv + vec2(0.0,  uTexelSize.y)).rgb;
+                    vec3 w = texture2D(sTexture, uv + vec2(-uTexelSize.x, 0.0)).rgb;
+                    vec3 e = texture2D(sTexture, uv + vec2( uTexelSize.x, 0.0)).rgb;
+
+                    vec3 min4 = min(min(n, s), min(w, e));
+                    vec3 max4 = max(max(n, s), max(w, e));
+                    vec3 minAll = min(min4, center);
+                    vec3 maxAll = max(max4, center);
+
+                    vec3 amp = sqrt(clamp(min(minAll, 1.0 - maxAll) / max(maxAll, vec3(0.0001)), 0.0, 1.0));
+                    float peak = -1.0 / mix(8.0, 4.5, clamp(sharpStrength, 0.0, 1.0));
+                    vec3 wobe = amp * peak;
+                    vec3 res = ((n + s + w + e) * wobe + center) / (1.0 + 4.0 * wobe);
+                    if (antiRinging) {
+                        res = clamp(res, minAll, maxAll);
+                    }
+                    return clamp(res, 0.0, 1.0);
+                }
+
+                vec3 sampleFsr1EasuRcas(vec2 uv, float sharpStrength, bool ultraAntiRinging) {
+                    vec2 texPos = uv * uSourceSize - 0.5;
+                    vec2 baseTex = (floor(texPos) + 0.5) * uTexelSize;
+                    vec2 f = fract(texPos);
+                    vec2 dx = vec2(uTexelSize.x, 0.0);
+                    vec2 dy = vec2(0.0, uTexelSize.y);
+
+                    vec3 f0 = texture2D(sTexture, baseTex).rgb;
+                    vec3 g  = texture2D(sTexture, baseTex + dx).rgb;
+                    vec3 j  = texture2D(sTexture, baseTex + dy).rgb;
+                    vec3 k  = texture2D(sTexture, baseTex + dx + dy).rgb;
+
+                    float lf = luma(f0), lg = luma(g), lj = luma(j), lk = luma(k);
+                    float gradX = ((lg - lf) + (lk - lj)) * 0.5;
+                    float gradY = ((lj - lf) + (lk - lg)) * 0.5;
+                    float gradLen = max(sqrt(gradX * gradX + gradY * gradY), 0.0001);
+                    vec2 dir = vec2(-gradY, gradX) / gradLen;
+
+                    vec3 bilinear = mix(mix(f0, g, f.x), mix(j, k, f.x), f.y);
+                    vec3 tangentA = texture2D(sTexture, uv + dir * uTexelSize * 0.45).rgb;
+                    vec3 tangentB = texture2D(sTexture, uv - dir * uTexelSize * 0.45).rgb;
+                    float edgeAniso = clamp(gradLen * 4.0, 0.0, 1.0);
+                    vec3 easu = mix(bilinear, (tangentA + tangentB + bilinear) / 3.0, edgeAniso * 0.65);
+
+                    vec3 min4 = min(min(f0, g), min(j, k));
+                    vec3 max4 = max(max(f0, g), max(j, k));
+                    easu = clamp(easu, min4 * 0.96, max4 * 1.04);
+
+                    return sampleRcas(uv, easu, max(sharpStrength, 0.25), ultraAntiRinging);
+                }
+
+                vec3 sampleNvidiaNis(vec2 uv, float sharpStrength) {
+                    vec2 texPos = uv * uSourceSize - 0.5;
+                    vec2 f = fract(texPos);
+                    vec2 dx = vec2(uTexelSize.x, 0.0);
+                    vec2 dy = vec2(0.0, uTexelSize.y);
+
+                    vec3 c  = texture2D(sTexture, uv).rgb;
+                    vec3 n  = texture2D(sTexture, uv - dy).rgb;
+                    vec3 s  = texture2D(sTexture, uv + dy).rgb;
+                    vec3 w  = texture2D(sTexture, uv - dx).rgb;
+                    vec3 e  = texture2D(sTexture, uv + dx).rgb;
+                    vec3 nw = texture2D(sTexture, uv - dx - dy).rgb;
+                    vec3 ne = texture2D(sTexture, uv + dx - dy).rgb;
+                    vec3 sw = texture2D(sTexture, uv - dx + dy).rgb;
+                    vec3 se = texture2D(sTexture, uv + dx + dy).rgb;
+
+                    float gx = (luma(ne) + 2.0 * luma(e) + luma(se)) - (luma(nw) + 2.0 * luma(w) + luma(sw));
+                    float gy = (luma(sw) + 2.0 * luma(s) + luma(se)) - (luma(nw) + 2.0 * luma(n) + luma(ne));
+                    float edgeMag = clamp(sqrt(gx * gx + gy * gy), 0.0, 1.0);
+
+                    vec4 wx = cubicCatmullRomWeights(f.x);
+                    vec4 wy = cubicCatmullRomWeights(f.y);
+                    float phaseWeight = clamp(abs(wx.y - wx.z) + abs(wy.y - wy.z), 0.2, 1.0);
+
+                    vec3 detail = c - mix((n + s + w + e) * 0.25, (nw + ne + sw + se) * 0.25, 0.35);
+                    float nisBoost = mix(1.45, 0.65, edgeMag) * (0.45 + sharpStrength * 1.15) * (0.75 + 0.25 * phaseWeight);
+
+                    vec3 minN = min(min(min(n, s), min(w, e)), c);
+                    vec3 maxN = max(max(max(n, s), max(w, e)), c);
+                    return clamp(c + detail * nisBoost, minN * 0.90, maxN * 1.10);
+                }
+
+                vec3 sampleSnapdragonGsr(vec2 uv, float sharpStrength) {
+                    vec2 t = uTexelSize;
+                    vec3 c  = texture2D(sTexture, uv).rgb;
+                    vec3 n  = texture2D(sTexture, uv + vec2(0.0, -t.y)).rgb;
+                    vec3 s  = texture2D(sTexture, uv + vec2(0.0,  t.y)).rgb;
+                    vec3 w  = texture2D(sTexture, uv + vec2(-t.x, 0.0)).rgb;
+                    vec3 e  = texture2D(sTexture, uv + vec2( t.x, 0.0)).rgb;
+                    vec3 nw = texture2D(sTexture, uv + vec2(-t.x, -t.y)).rgb;
+                    vec3 ne = texture2D(sTexture, uv + vec2( t.x, -t.y)).rgb;
+                    vec3 sw = texture2D(sTexture, uv + vec2(-t.x,  t.y)).rgb;
+                    vec3 se = texture2D(sTexture, uv + vec2( t.x,  t.y)).rgb;
+
+                    float dirX = (ne.g + e.g + se.g) - (nw.g + w.g + sw.g);
+                    float dirY = (sw.g + s.g + se.g) - (nw.g + n.g + ne.g);
+                    float len = max(sqrt(dirX * dirX + dirY * dirY), 0.0001);
+                    vec2 isoDir = vec2(-dirY, dirX) / len;
+
+                    vec3 isoA = texture2D(sTexture, uv + isoDir * t * 0.4).rgb;
+                    vec3 isoB = texture2D(sTexture, uv - isoDir * t * 0.4).rgb;
+                    vec3 gsrBase = mix(c, (isoA + isoB + c) / 3.0, clamp(len * 2.5, 0.0, 0.6));
+
+                    float gw = abs(n.g - s.g) + abs(w.g - e.g);
+                    float edgeWeight = clamp(1.0 - gw * 2.0, 0.2, 1.0);
+                    vec3 lap = gsrBase * 4.0 - (n + s + w + e);
+                    return clamp(gsrBase + lap * ((0.35 + sharpStrength * 0.75) * edgeWeight) * 0.38, 0.0, 1.0);
+                }
+
+                vec3 sampleXessSpatial(vec2 uv, float sharpStrength) {
+                    vec2 t = uTexelSize;
+                    vec3 c  = texture2D(sTexture, uv).rgb;
+                    vec3 n  = texture2D(sTexture, uv + vec2(0.0, -t.y)).rgb;
+                    vec3 s  = texture2D(sTexture, uv + vec2(0.0,  t.y)).rgb;
+                    vec3 w  = texture2D(sTexture, uv + vec2(-t.x, 0.0)).rgb;
+                    vec3 e  = texture2D(sTexture, uv + vec2( t.x, 0.0)).rgb;
+                    vec3 nw = texture2D(sTexture, uv + vec2(-t.x, -t.y)).rgb;
+                    vec3 ne = texture2D(sTexture, uv + vec2( t.x, -t.y)).rgb;
+                    vec3 sw = texture2D(sTexture, uv + vec2(-t.x,  t.y)).rgb;
+                    vec3 se = texture2D(sTexture, uv + vec2( t.x,  t.y)).rgb;
+
+                    vec3 box = (n + s + w + e) * 0.15 + (nw + ne + sw + se) * 0.05 + c * 0.20;
+                    vec3 minBox = min(min(min(n, s), min(w, e)), c);
+                    vec3 maxBox = max(max(max(n, s), max(w, e)), c);
+                    return clamp(c + (c - box) * (0.50 + sharpStrength * 0.90), minBox, maxBox);
+                }
+
+                vec3 sampleLanczos3(vec2 uv, float sharpStrength) {
+                    vec2 texPos = uv * uSourceSize - 0.5;
+                    vec2 baseTex = (floor(texPos) + 0.5) * uTexelSize;
+                    vec2 f = fract(texPos);
+
+                    vec3 sum = vec3(0.0);
+                    float weightSum = 0.0;
+                    for (int j = -1; j <= 2; j++) {
+                        float wy = lanczosWeight(float(j) - f.y, 2.0);
+                        for (int i = -1; i <= 2; i++) {
+                            float wx = lanczosWeight(float(i) - f.x, 2.0);
+                            float w = wx * wy;
+                            sum += texture2D(sTexture, baseTex + vec2(float(i), float(j)) * uTexelSize).rgb * w;
+                            weightSum += w;
+                        }
+                    }
+                    vec3 lanczos = sum / max(weightSum, 0.0001);
+                    if (sharpStrength > 0.05) {
+                        lanczos = sampleRcas(uv, lanczos, sharpStrength * 0.55, true);
+                    }
+                    return clamp(lanczos, 0.0, 1.0);
+                }
+
+                vec3 sampleCatmullRom(vec2 uv, float sharpStrength) {
+                    vec2 texPos = uv * uSourceSize - 0.5;
+                    vec2 baseTex = (floor(texPos) + 0.5) * uTexelSize;
+                    vec2 f = fract(texPos);
+
+                    vec4 wx = cubicCatmullRomWeights(f.x);
+                    vec4 wy = cubicCatmullRomWeights(f.y);
+
+                    float w12x = wx.y + wx.z;
+                    float w12y = wy.y + wy.z;
+                    float off12x = wx.z / max(w12x, 0.0001);
+                    float off12y = wy.z / max(w12y, 0.0001);
+
+                    vec2 tc0 = baseTex - uTexelSize;
+                    vec2 tc3 = baseTex + 2.0 * uTexelSize;
+                    vec2 tc12 = baseTex + vec2(off12x, off12y) * uTexelSize;
+
+                    vec3 s0 = texture2D(sTexture, vec2(tc12.x, tc0.y)).rgb * (w12x * wy.x);
+                    vec3 s1 = texture2D(sTexture, vec2(tc0.x, tc12.y)).rgb * (wx.x * w12y);
+                    vec3 s2 = texture2D(sTexture, tc12).rgb * (w12x * w12y);
+                    vec3 s3 = texture2D(sTexture, vec2(tc3.x, tc12.y)).rgb * (wx.w * w12y);
+                    vec3 s4 = texture2D(sTexture, vec2(tc12.x, tc3.y)).rgb * (w12x * wy.w);
+
+                    float totalW = (w12x * wy.x) + (wx.x * w12y) + (w12x * w12y) + (wx.w * w12y) + (w12x * wy.w);
+                    vec3 bicubic = (s0 + s1 + s2 + s3 + s4) / max(totalW, 0.0001);
+                    if (sharpStrength > 0.05) {
+                        bicubic = sampleRcas(uv, bicubic, sharpStrength * 0.45, true);
+                    }
+                    return clamp(bicubic, 0.0, 1.0);
+                }
+
+                vec3 sampleAnime4K(vec2 uv, float sharpStrength) {
+                    vec2 t = uTexelSize;
+                    vec3 c  = texture2D(sTexture, uv).rgb;
+                    vec3 n  = texture2D(sTexture, uv + vec2(0.0, -t.y)).rgb;
+                    vec3 s  = texture2D(sTexture, uv + vec2(0.0,  t.y)).rgb;
+                    vec3 w  = texture2D(sTexture, uv + vec2(-t.x, 0.0)).rgb;
+                    vec3 e  = texture2D(sTexture, uv + vec2( t.x, 0.0)).rgb;
+                    vec3 nw = texture2D(sTexture, uv + vec2(-t.x, -t.y)).rgb;
+                    vec3 ne = texture2D(sTexture, uv + vec2( t.x, -t.y)).rgb;
+                    vec3 sw = texture2D(sTexture, uv + vec2(-t.x,  t.y)).rgb;
+                    vec3 se = texture2D(sTexture, uv + vec2( t.x,  t.y)).rgb;
+
+                    vec3 lightest = max(max(max(n, s), max(w, e)), max(max(nw, ne), max(sw, se)));
+                    vec3 darkest  = min(min(min(n, s), min(w, e)), min(min(nw, ne), min(sw, se)));
+                    float lc = luma(c);
+                    float lAvg = (luma(n) + luma(s) + luma(w) + luma(e) + luma(nw) + luma(ne) + luma(sw) + luma(se)) * 0.125;
+                    float pushStrength = clamp((0.40 + sharpStrength * 0.60), 0.0, 1.0);
+                    return clamp((lc > lAvg) ? mix(c, lightest, pushStrength * 0.55) : mix(c, darkest, pushStrength * 0.55), 0.0, 1.0);
+                }
+
+                vec3 sampleNearestInteger(vec2 uv) {
+                    vec2 snappedUv = (floor(uv * uSourceSize) + 0.5) / uSourceSize;
+                    return texture2D(sTexture, snappedUv).rgb;
+                }
+
+                vec3 applyColorGrade(vec3 c) {
+                    if (uFullRange == 0) {
+                        c = clamp((c - vec3(0.062745)) * 1.164383, 0.0, 1.0);
+                    }
+                    c = clamp((c - 0.5) * uContrast + 0.5 + uBrightness, 0.0, 1.0);
+                    if (abs(uGamma - 1.0) > 0.01) {
+                        c = pow(c, vec3(1.0 / max(uGamma, 0.2)));
+                    }
+                    vec3 lumaWeights = (uColorSpace == 1)
+                        ? vec3(0.299, 0.587, 0.114)
+                        : vec3(0.2126, 0.7152, 0.0722);
+                    float l = dot(c, lumaWeights);
+                    c = mix(vec3(l), c, uSaturation);
+                    return clamp(c, 0.0, 1.0);
+                }
+
+                void main() {
+                    vec3 center = texture2D(sTexture, vTexCoord).rgb;
+                    vec3 upscaled = center;
+
+                    if (uUpscalerMode == 1) {
+                        upscaled = sampleNearestInteger(vTexCoord);
+                    } else if (uUpscalerMode == 2) {
+                        upscaled = sampleFsr1EasuRcas(vTexCoord, uSharpness, false);
+                    } else if (uUpscalerMode == 3) {
+                        upscaled = sampleFsr1EasuRcas(vTexCoord, uSharpness, true);
+                    } else if (uUpscalerMode == 4) {
+                        upscaled = sampleRcas(vTexCoord, center, max(uSharpness, 0.25), true);
+                    } else if (uUpscalerMode == 5) {
+                        upscaled = sampleNvidiaNis(vTexCoord, uSharpness);
+                    } else if (uUpscalerMode == 6) {
+                        upscaled = sampleSnapdragonGsr(vTexCoord, uSharpness);
+                    } else if (uUpscalerMode == 7) {
+                        upscaled = sampleXessSpatial(vTexCoord, uSharpness);
+                    } else if (uUpscalerMode == 8) {
+                        upscaled = sampleLanczos3(vTexCoord, uSharpness);
+                    } else if (uUpscalerMode == 9) {
+                        upscaled = sampleCatmullRom(vTexCoord, uSharpness);
+                    } else if (uUpscalerMode == 10) {
+                        upscaled = sampleAnime4K(vTexCoord, uSharpness);
+                    } else {
+                        if (uSharpness > 0.02) {
+                            upscaled = sampleRcas(vTexCoord, center, uSharpness * 0.65, true);
+                        }
+                    }
+
+                    vec3 graded = applyColorGrade(upscaled);
+                    if (uShowGrid == 1) {
+                        bool thirdsX = abs(vRawUv.x - 0.3333) < 0.0018 || abs(vRawUv.x - 0.6667) < 0.0018;
+                        bool thirdsY = abs(vRawUv.y - 0.3333) < 0.0028 || abs(vRawUv.y - 0.6667) < 0.0028;
+                        bool safeBorder = (
+                            (abs(vRawUv.x - 0.05) < 0.0018 || abs(vRawUv.x - 0.95) < 0.0018) && vRawUv.y >= 0.05 && vRawUv.y <= 0.95
+                        ) || (
+                            (abs(vRawUv.y - 0.05) < 0.0028 || abs(vRawUv.y - 0.95) < 0.0028) && vRawUv.x >= 0.05 && vRawUv.x <= 0.95
+                        );
+                        if (thirdsX || thirdsY) {
+                            graded = mix(graded, vec3(0.22, 0.74, 0.97), 0.55);
+                        } else if (safeBorder) {
+                            graded = mix(graded, vec3(0.98, 0.75, 0.18), 0.65);
+                        }
+                    }
+                    gl_FragColor = vec4(graded, 1.0);
+                }
+            """.trimIndent()
+        }
     }
 
     private val quadVertices: FloatBuffer = ByteBuffer.allocateDirect(4 * 4 * 4)
@@ -620,15 +620,18 @@ class HardwareVideoRenderer(
     private val mvpMatrix = FloatArray(16)
     private val texMatrix = FloatArray(16)
 
+    // Shader programs
+    private var oesUpscaleProgram = 0
+    private var tex2dUpscaleProgram = 0
     private var oesToFboProgram = 0
     private var patternToFboProgram = 0
-    private var compositeFgUpscaleProgram = 0
+    private var frameGenProgram = 0
 
     private var oesTextureId = 0
 
-    // Ping-Pong History FBOs for Frame Generation (slot 0 and slot 1)
-    private val historyFboIds = IntArray(2)
-    private val historyTexIds = IntArray(2)
+    // Ping-Pong History FBOs (slot 0 and slot 1) + FrameGen intermediate output FBO (slot 2)
+    private val historyFboIds = IntArray(3)
+    private val historyTexIds = IntArray(3)
     private var currentHistorySlot = 0
     private var historyBufferWidth = 0
     private var historyBufferHeight = 0
@@ -645,7 +648,7 @@ class HardwareVideoRenderer(
     private var renderConfig = RenderConfig()
 
     @Volatile
-    private var activeMode = VideoMode(1920, 1080, 60)
+    private var activeMode = VideoMode(1920, 1080, 30)
 
     @Volatile
     private var activeCameraId: String? = null
@@ -656,13 +659,16 @@ class HardwareVideoRenderer(
     @Volatile
     private var hasReceivedAnyCameraFrame = false
 
+    @Volatile
+    private var receivedCameraFrames = 0L
+
     private var viewportWidth = 1920
     private var viewportHeight = 1080
     private var startTimeNs = System.nanoTime()
 
     // Timing & Frame Generation phase tracking
     private var lastSourceFrameTimeNs = System.nanoTime()
-    private var estimatedSourceIntervalNs = 16_666_667L // 60Hz default
+    private var estimatedSourceIntervalNs = 33_333_333L // 30Hz default
     private var lastPatternTickNs = System.nanoTime()
 
     private var sourceFrameCount = 0
@@ -672,9 +678,9 @@ class HardwareVideoRenderer(
     private var lastFrameTimestampNs = System.nanoTime()
     private var smoothedFrameTimeMs = 8.3f
 
-    // --- Capture lifecycle / signal watchdog state ---
+    // Synchronized camera session lifecycle state
+    private val cameraLock = Any()
     private val mainHandler = Handler(Looper.getMainLooper())
-    private val startPending = AtomicBoolean(false)
 
     @Volatile
     private var streamGeneration = 0
@@ -688,7 +694,9 @@ class HardwareVideoRenderer(
     @Volatile
     private var hasCameraPermissionFlag = false
 
-    /** Actual negotiated stream size (may differ from the requested mode if the card lacks it). */
+    @Volatile
+    private var fallbackTier = 0
+
     @Volatile
     private var captureWidth = 1920
 
@@ -698,7 +706,7 @@ class HardwareVideoRenderer(
     @Volatile
     private var lastCameraFrameNs = 0L
 
-    // Blank-feed ("card connected but no HDMI source") detection
+    // Optional blank-feed detection (off by default so dark scenes are never hidden)
     private var blankSignal = false
     private var blankSinceNs = 0L
     private var lastBlankSampleNs = 0L
@@ -727,32 +735,34 @@ class HardwareVideoRenderer(
 
         if (cameraId != null && hasCameraPermission) {
             if (!capturePaused && (modeOrCamChanged || !cameraOpenRequested)) {
-                requestStartStream()
+                fallbackTier = 0
+                startCamera2StreamAsync()
             }
         } else {
-            mainHandler.post { stopCamera2Stream() }
+            stopCamera2StreamSync()
         }
     }
 
     /** Releases the camera (clears Android's green privacy dot) while the app is in the background. */
     fun pauseCapture() {
         capturePaused = true
-        mainHandler.post { stopCamera2Stream() }
+        mainHandler.removeCallbacksAndMessages(null)
+        stopCamera2StreamSync()
     }
 
     /** Re-opens the capture card stream when the app returns to the foreground. */
     fun resumeCapture() {
         capturePaused = false
-        if (activeCameraId != null && hasCameraPermissionFlag) requestStartStream()
+        if (activeCameraId != null && hasCameraPermissionFlag && !cameraOpenRequested) {
+            fallbackTier = 0
+            startCamera2StreamAsync()
+        }
     }
 
-    /** Coalesces start requests onto the main thread so open/close never overlap or race. */
-    private fun requestStartStream() {
-        if (startPending.compareAndSet(false, true)) {
-            mainHandler.post {
-                startPending.set(false)
-                startCamera2Stream()
-            }
+    private fun startCamera2StreamAsync() {
+        mainHandler.removeCallbacksAndMessages(null)
+        mainHandler.post {
+            startCamera2StreamInternal()
         }
     }
 
@@ -764,9 +774,11 @@ class HardwareVideoRenderer(
         val vkInfo = VulkanHardwarePipeline.queryDeviceVulkanSupport(context)
         gpuRendererString = "$renderer (${vkInfo.apiVersionString})"
 
+        oesUpscaleProgram = createGlProgram(VERTEX_SHADER, buildUpscalerFragmentShader(isExternalOes = true))
+        tex2dUpscaleProgram = createGlProgram(VERTEX_SHADER, buildUpscalerFragmentShader(isExternalOes = false))
         oesToFboProgram = createGlProgram(VERTEX_SHADER, FRAGMENT_SHADER_OES_TO_FBO)
         patternToFboProgram = createGlProgram(VERTEX_SHADER, FRAGMENT_SHADER_PATTERN_TO_FBO)
-        compositeFgUpscaleProgram = createGlProgram(VERTEX_SHADER, FRAGMENT_SHADER_COMPOSITE_FG_AND_UPSCALE)
+        frameGenProgram = createGlProgram(VERTEX_SHADER, FRAGMENT_SHADER_FRAME_GEN_FBO)
 
         val oesTex = IntArray(1)
         GLES20.glGenTextures(1, oesTex, 0)
@@ -778,20 +790,34 @@ class HardwareVideoRenderer(
         GLES20.glTexParameteri(GLES11Ext.GL_TEXTURE_EXTERNAL_OES, GLES20.GL_TEXTURE_WRAP_S, GLES20.GL_CLAMP_TO_EDGE)
         GLES20.glTexParameteri(GLES11Ext.GL_TEXTURE_EXTERNAL_OES, GLES20.GL_TEXTURE_WRAP_T, GLES20.GL_CLAMP_TO_EDGE)
 
-        ensureHistoryFbos(captureWidth, captureHeight)
+        // Reset FBO state for the new GL context
+        historyFboIds.fill(0)
+        historyTexIds.fill(0)
+        historyBufferWidth = 0
+        historyBufferHeight = 0
 
-        // A fresh GL context needs a fresh SurfaceTexture; drop the old one (and the stream bound to it)
-        mainHandler.post { stopCamera2Stream() }
-        try { captureSurface?.release() } catch (_: Exception) {}
-        try { surfaceTexture?.release() } catch (_: Exception) {}
-        surfaceTexture = SurfaceTexture(oesTextureId).apply {
-            setDefaultBufferSize(activeMode.width, activeMode.height)
-            setOnFrameAvailableListener(this@HardwareVideoRenderer)
+        // Stop any previous camera session synchronously BEFORE replacing the SurfaceTexture
+        stopCamera2StreamSync()
+        synchronized(cameraLock) {
+            try {
+                captureSurface?.release()
+            } catch (_: Exception) {
+            }
+            try {
+                surfaceTexture?.release()
+            } catch (_: Exception) {
+            }
+            val st = SurfaceTexture(oesTextureId).apply {
+                setDefaultBufferSize(activeMode.width, activeMode.height)
+                setOnFrameAvailableListener(this@HardwareVideoRenderer, mainHandler)
+            }
+            surfaceTexture = st
+            captureSurface = Surface(st)
         }
-        captureSurface = Surface(surfaceTexture)
 
         if (activeCameraId != null && hasCameraPermissionFlag && !capturePaused) {
-            requestStartStream()
+            fallbackTier = 0
+            startCamera2StreamAsync()
         }
     }
 
@@ -801,14 +827,14 @@ class HardwareVideoRenderer(
         if (w == historyBufferWidth && h == historyBufferHeight && historyFboIds[0] != 0) return
 
         if (historyFboIds[0] != 0) {
-            GLES20.glDeleteFramebuffers(2, historyFboIds, 0)
-            GLES20.glDeleteTextures(2, historyTexIds, 0)
+            GLES20.glDeleteFramebuffers(3, historyFboIds, 0)
+            GLES20.glDeleteTextures(3, historyTexIds, 0)
         }
 
-        GLES20.glGenTextures(2, historyTexIds, 0)
-        GLES20.glGenFramebuffers(2, historyFboIds, 0)
+        GLES20.glGenTextures(3, historyTexIds, 0)
+        GLES20.glGenFramebuffers(3, historyFboIds, 0)
 
-        for (slot in 0..1) {
+        for (slot in 0..2) {
             GLES20.glBindTexture(GLES20.GL_TEXTURE_2D, historyTexIds[slot])
             GLES20.glTexImage2D(
                 GLES20.GL_TEXTURE_2D, 0, GLES20.GL_RGBA,
@@ -848,39 +874,49 @@ class HardwareVideoRenderer(
         smoothedFrameTimeMs = smoothedFrameTimeMs * 0.85f + min(deltaMs, 100f) * 0.15f
 
         val cfg = renderConfig
-        // Signal watchdog: live only while frames keep arriving and the feed is not a blank "no HDMI" picture
-        val framesFresh = hasReceivedAnyCameraFrame && (nowNs - lastCameraFrameNs) < 1_500_000_000L
-        val liveActive = useLiveCameraStream && framesFresh && !blankSignal
+        val fgEnabled = cfg.frameGenMode != FrameGenMode.OFF && frameGenProgram != 0 && tex2dUpscaleProgram != 0
 
         if (frameAvailable) {
             frameAvailable = false
-            hasReceivedAnyCameraFrame = true
+            val prevCount = receivedCameraFrames
+            try {
+                surfaceTexture?.updateTexImage()
+                surfaceTexture?.getTransformMatrix(texMatrix)
+                receivedCameraFrames = prevCount + 1
+                hasReceivedAnyCameraFrame = true
+                lastCameraFrameNs = nowNs
+            } catch (e: Exception) {
+                Log.w(TAG, "updateTexImage error: ${e.message}")
+            }
+
             val interval = (nowNs - lastSourceFrameTimeNs).coerceIn(4_000_000L, 100_000_000L)
             estimatedSourceIntervalNs = (estimatedSourceIntervalNs * 3 + interval) / 4
             lastSourceFrameTimeNs = nowNs
             sourceFrameCount++
 
-            try {
-                surfaceTexture?.updateTexImage()
-                surfaceTexture?.getTransformMatrix(texMatrix)
-            } catch (_: Exception) {
-            }
-
-            ensureHistoryFbos(captureWidth, captureHeight)
-            // Advance ping-pong history slot and capture new OES frame into currentHistorySlot
-            currentHistorySlot = 1 - currentHistorySlot
-            GLES20.glBindFramebuffer(GLES20.GL_FRAMEBUFFER, historyFboIds[currentHistorySlot])
-            GLES20.glViewport(0, 0, historyBufferWidth, historyBufferHeight)
-            drawOesToHistoryFbo()
-            if (cfg.autoDetectBlankSignal) {
-                sampleBlankSignal(nowNs)
+            if (fgEnabled || cfg.autoDetectBlankSignal) {
+                ensureHistoryFbos(captureWidth, captureHeight)
+                currentHistorySlot = 1 - currentHistorySlot
+                GLES20.glBindFramebuffer(GLES20.GL_FRAMEBUFFER, historyFboIds[currentHistorySlot])
+                GLES20.glViewport(0, 0, historyBufferWidth, historyBufferHeight)
+                drawOesToHistoryFbo()
+                if (cfg.autoDetectBlankSignal) {
+                    sampleBlankSignal(nowNs)
+                } else {
+                    blankSignal = false
+                    blankSinceNs = 0L
+                }
             } else {
                 blankSignal = false
                 blankSinceNs = 0L
             }
-        } else if (!liveActive && cfg.showTestPatternWhenNoSignal) {
-            // In calibration test pattern mode, tick simulated source frames at activeMode.fps (or 60Hz when FG is active)
-            val simSourceFps = if (cfg.frameGenMode != FrameGenMode.OFF) {
+        }
+
+        val framesFresh = hasReceivedAnyCameraFrame && (nowNs - lastCameraFrameNs) < 2_500_000_000L
+        val liveActive = useLiveCameraStream && framesFresh && (!cfg.autoDetectBlankSignal || !blankSignal)
+
+        if (!liveActive && cfg.showTestPatternWhenNoSignal) {
+            val simSourceFps = if (fgEnabled) {
                 activeMode.fps.coerceAtMost(60)
             } else {
                 activeMode.fps
@@ -900,41 +936,108 @@ class HardwareVideoRenderer(
             }
         }
 
-        // Bind screen backbuffer and run Pass 2 (Frame Generation + Spatial Upscaler + Color Grading)
-        GLES20.glBindFramebuffer(GLES20.GL_FRAMEBUFFER, 0)
-        GLES20.glViewport(0, 0, viewportWidth, viewportHeight)
-        GLES20.glClear(GLES20.GL_COLOR_BUFFER_BIT)
+        computeMvpMatrix(cfg)
 
-        if ((liveActive || cfg.showTestPatternWhenNoSignal) && compositeFgUpscaleProgram != 0) {
-            computeMvpMatrix(cfg)
+        if (useLiveCameraStream && hasReceivedAnyCameraFrame && (!cfg.autoDetectBlankSignal || !blankSignal)) {
+            if (fgEnabled && historyBufferWidth > 0) {
+                val rawPhase = if (estimatedSourceIntervalNs > 0) {
+                    ((nowNs - lastSourceFrameTimeNs).toFloat() / estimatedSourceIntervalNs.toFloat()).coerceIn(0.05f, 1.0f)
+                } else {
+                    1.0f
+                }
+                if (rawPhase < 0.92f) generatedFrameCount++
+                presentedFrameCount++
 
-            // Calculate fractional interpolation phase in (0..1) between prevHistorySlot and currentHistorySlot
-            val fgEnabled = cfg.frameGenMode != FrameGenMode.OFF
+                // Pass 2: Synthesize FrameGen intermediate frame into historyFboIds[2]
+                GLES20.glBindFramebuffer(GLES20.GL_FRAMEBUFFER, historyFboIds[2])
+                GLES20.glViewport(0, 0, historyBufferWidth, historyBufferHeight)
+                drawFrameGenToFbo(
+                    currTexId = historyTexIds[currentHistorySlot],
+                    prevTexId = historyTexIds[1 - currentHistorySlot],
+                    srcWidth = historyBufferWidth,
+                    srcHeight = historyBufferHeight,
+                    phase = rawPhase,
+                    cfg = cfg
+                )
+
+                // Pass 3: Upscale synthesized 2D texture to screen backbuffer
+                GLES20.glBindFramebuffer(GLES20.GL_FRAMEBUFFER, 0)
+                GLES20.glViewport(0, 0, viewportWidth, viewportHeight)
+                GLES20.glClear(GLES20.GL_COLOR_BUFFER_BIT)
+                drawUpscaledQuad(
+                    program = tex2dUpscaleProgram,
+                    isExternalOes = false,
+                    textureId = historyTexIds[2],
+                    texMat = identityMatrix,
+                    srcWidth = historyBufferWidth,
+                    srcHeight = historyBufferHeight,
+                    cfg = cfg
+                )
+            } else {
+                // Direct Zero-Copy OES -> Screen path (Fastest, zero FBO latency)
+                presentedFrameCount++
+                GLES20.glBindFramebuffer(GLES20.GL_FRAMEBUFFER, 0)
+                GLES20.glViewport(0, 0, viewportWidth, viewportHeight)
+                GLES20.glClear(GLES20.GL_COLOR_BUFFER_BIT)
+                if (oesUpscaleProgram != 0) {
+                    drawUpscaledQuad(
+                        program = oesUpscaleProgram,
+                        isExternalOes = true,
+                        textureId = oesTextureId,
+                        texMat = texMatrix,
+                        srcWidth = captureWidth.coerceAtLeast(1),
+                        srcHeight = captureHeight.coerceAtLeast(1),
+                        cfg = cfg
+                    )
+                } else if (oesToFboProgram != 0) {
+                    drawOesFallbackToScreen()
+                }
+            }
+        } else if (cfg.showTestPatternWhenNoSignal && tex2dUpscaleProgram != 0 && historyBufferWidth > 0) {
             val rawPhase = if (fgEnabled && estimatedSourceIntervalNs > 0) {
                 ((nowNs - lastSourceFrameTimeNs).toFloat() / estimatedSourceIntervalNs.toFloat()).coerceIn(0.05f, 1.0f)
             } else {
                 1.0f
             }
-
-            if (fgEnabled && rawPhase < 0.92f) {
-                generatedFrameCount++
-            }
+            if (fgEnabled && rawPhase < 0.92f) generatedFrameCount++
             presentedFrameCount++
 
-            val currTex = historyTexIds[currentHistorySlot]
-            val prevTex = historyTexIds[1 - currentHistorySlot]
-            drawCompositeFgAndUpscale(
-                currTexId = currTex,
-                prevTexId = prevTex,
-                srcWidth = historyBufferWidth.coerceAtLeast(1),
-                srcHeight = historyBufferHeight.coerceAtLeast(1),
-                phase = rawPhase,
+            val source2dTex = if (fgEnabled) {
+                GLES20.glBindFramebuffer(GLES20.GL_FRAMEBUFFER, historyFboIds[2])
+                GLES20.glViewport(0, 0, historyBufferWidth, historyBufferHeight)
+                drawFrameGenToFbo(
+                    currTexId = historyTexIds[currentHistorySlot],
+                    prevTexId = historyTexIds[1 - currentHistorySlot],
+                    srcWidth = historyBufferWidth,
+                    srcHeight = historyBufferHeight,
+                    phase = rawPhase,
+                    cfg = cfg
+                )
+                historyTexIds[2]
+            } else {
+                historyTexIds[currentHistorySlot]
+            }
+
+            GLES20.glBindFramebuffer(GLES20.GL_FRAMEBUFFER, 0)
+            GLES20.glViewport(0, 0, viewportWidth, viewportHeight)
+            GLES20.glClear(GLES20.GL_COLOR_BUFFER_BIT)
+            drawUpscaledQuad(
+                program = tex2dUpscaleProgram,
+                isExternalOes = false,
+                textureId = source2dTex,
+                texMat = identityMatrix,
+                srcWidth = historyBufferWidth,
+                srcHeight = historyBufferHeight,
                 cfg = cfg
             )
+        } else {
+            GLES20.glBindFramebuffer(GLES20.GL_FRAMEBUFFER, 0)
+            GLES20.glViewport(0, 0, viewportWidth, viewportHeight)
+            GLES20.glClear(GLES20.GL_COLOR_BUFFER_BIT)
         }
 
         val elapsedNs = nowNs - lastTelemetryTimeNs
-        if (elapsedNs >= 450_000_000L) {
+        if (elapsedNs >= 350_000_000L) {
             val sec = elapsedNs / 1_000_000_000f
             val measuredSourceFps = sourceFrameCount / sec
             val measuredPresentedFps = presentedFrameCount / sec
@@ -944,7 +1047,7 @@ class HardwareVideoRenderer(
                 FrameGenMultiplier.AUTO_DISPLAY_HZ -> 2
                 else -> cfg.frameGenMultiplier.factor
             }
-            val effectiveOutFps = if (cfg.frameGenMode != FrameGenMode.OFF && (liveActive || cfg.showTestPatternWhenNoSignal)) {
+            val effectiveOutFps = if (fgEnabled && (liveActive || cfg.showTestPatternWhenNoSignal)) {
                 max(measuredPresentedFps, measuredSourceFps * multiplierFactor)
             } else {
                 measuredSourceFps
@@ -953,7 +1056,7 @@ class HardwareVideoRenderer(
             onTelemetryTick(
                 measuredSourceFps,
                 effectiveOutFps,
-                if (cfg.frameGenMode != FrameGenMode.OFF) max(measuredGenFps, effectiveOutFps - measuredSourceFps) else 0f,
+                if (fgEnabled) max(measuredGenFps, effectiveOutFps - measuredSourceFps) else 0f,
                 smoothedFrameTimeMs,
                 liveActive,
                 gpuRendererString
@@ -998,6 +1101,33 @@ class HardwareVideoRenderer(
         GLES20.glDrawArrays(GLES20.GL_TRIANGLE_STRIP, 0, 4)
     }
 
+    private fun drawOesFallbackToScreen() {
+        GLES20.glUseProgram(oesToFboProgram)
+
+        val posLoc = GLES20.glGetAttribLocation(oesToFboProgram, "aPosition")
+        val texLoc = GLES20.glGetAttribLocation(oesToFboProgram, "aTextureCoord")
+        val mvpLoc = GLES20.glGetUniformLocation(oesToFboProgram, "uMVPMatrix")
+        val texMatLoc = GLES20.glGetUniformLocation(oesToFboProgram, "uTexMatrix")
+
+        quadVertices.position(0)
+        GLES20.glVertexAttribPointer(posLoc, 2, GLES20.GL_FLOAT, false, 16, quadVertices)
+        GLES20.glEnableVertexAttribArray(posLoc)
+
+        quadVertices.position(2)
+        GLES20.glVertexAttribPointer(texLoc, 2, GLES20.GL_FLOAT, false, 16, quadVertices)
+        GLES20.glEnableVertexAttribArray(texLoc)
+
+        GLES20.glUniformMatrix4fv(mvpLoc, 1, false, mvpMatrix, 0)
+        GLES20.glUniformMatrix4fv(texMatLoc, 1, false, texMatrix, 0)
+        GLES20.glUniform1f(GLES20.glGetUniformLocation(oesToFboProgram, "uOverscanCrop"), renderConfig.overscanCropPercent.coerceIn(0f, 0.15f))
+
+        GLES20.glActiveTexture(GLES20.GL_TEXTURE0)
+        GLES20.glBindTexture(GLES11Ext.GL_TEXTURE_EXTERNAL_OES, oesTextureId)
+        GLES20.glUniform1i(GLES20.glGetUniformLocation(oesToFboProgram, "sOesTexture"), 0)
+
+        GLES20.glDrawArrays(GLES20.GL_TRIANGLE_STRIP, 0, 4)
+    }
+
     private fun drawPatternToHistoryFbo(timeSec: Float) {
         GLES20.glUseProgram(patternToFboProgram)
 
@@ -1022,7 +1152,7 @@ class HardwareVideoRenderer(
         GLES20.glDrawArrays(GLES20.GL_TRIANGLE_STRIP, 0, 4)
     }
 
-    private fun drawCompositeFgAndUpscale(
+    private fun drawFrameGenToFbo(
         currTexId: Int,
         prevTexId: Int,
         srcWidth: Int,
@@ -1030,7 +1160,7 @@ class HardwareVideoRenderer(
         phase: Float,
         cfg: RenderConfig
     ) {
-        val prog = compositeFgUpscaleProgram
+        val prog = frameGenProgram
         GLES20.glUseProgram(prog)
 
         val posLoc = GLES20.glGetAttribLocation(prog, "aPosition")
@@ -1046,29 +1176,71 @@ class HardwareVideoRenderer(
         GLES20.glVertexAttribPointer(texLoc, 2, GLES20.GL_FLOAT, false, 16, quadVertices)
         GLES20.glEnableVertexAttribArray(texLoc)
 
-        GLES20.glUniformMatrix4fv(mvpLoc, 1, false, mvpMatrix, 0)
+        GLES20.glUniformMatrix4fv(mvpLoc, 1, false, identityMatrix, 0)
         GLES20.glUniformMatrix4fv(texMatLoc, 1, false, identityMatrix, 0)
-        GLES20.glUniform1f(GLES20.glGetUniformLocation(prog, "uOverscanCrop"), cfg.overscanCropPercent.coerceIn(0f, 0.15f))
+        GLES20.glUniform1f(GLES20.glGetUniformLocation(prog, "uOverscanCrop"), 0f)
 
         val safeW = srcWidth.coerceAtLeast(1).toFloat()
         val safeH = srcHeight.coerceAtLeast(1).toFloat()
         GLES20.glUniform2f(GLES20.glGetUniformLocation(prog, "uTexelSize"), 1f / safeW, 1f / safeH)
-        GLES20.glUniform2f(GLES20.glGetUniformLocation(prog, "uSourceSize"), safeW, safeH)
-        GLES20.glUniform1i(GLES20.glGetUniformLocation(prog, "uUpscalerMode"), cfg.filteringMode.code)
         GLES20.glUniform1i(GLES20.glGetUniformLocation(prog, "uFrameGenMode"), cfg.frameGenMode.code)
         GLES20.glUniform1f(GLES20.glGetUniformLocation(prog, "uFrameGenPhase"), phase)
         GLES20.glUniform1f(GLES20.glGetUniformLocation(prog, "uMotionScale"), cfg.frameGenMotionScale)
         GLES20.glUniform1f(GLES20.glGetUniformLocation(prog, "uAntiGhosting"), cfg.frameGenAntiGhosting)
         GLES20.glUniform1i(GLES20.glGetUniformLocation(prog, "uUiProtection"), if (cfg.frameGenUiProtection) 1 else 0)
 
-        GLES20.glUniform1f(GLES20.glGetUniformLocation(prog, "uBrightness"), cfg.brightness)
-        GLES20.glUniform1f(GLES20.glGetUniformLocation(prog, "uContrast"), cfg.contrast)
-        GLES20.glUniform1f(GLES20.glGetUniformLocation(prog, "uSaturation"), cfg.saturation)
-        GLES20.glUniform1f(GLES20.glGetUniformLocation(prog, "uGamma"), cfg.gamma)
-        GLES20.glUniform1f(GLES20.glGetUniformLocation(prog, "uSharpness"), cfg.sharpness)
-        GLES20.glUniform1i(GLES20.glGetUniformLocation(prog, "uFullRange"), if (cfg.fullRangeRgb) 1 else 0)
-        GLES20.glUniform1i(GLES20.glGetUniformLocation(prog, "uColorSpace"), cfg.colorSpace.code)
-        GLES20.glUniform1i(GLES20.glGetUniformLocation(prog, "uShowGrid"), if (cfg.showSafeAreaGrid) 1 else 0)
+        GLES20.glActiveTexture(GLES20.GL_TEXTURE0)
+        GLES20.glBindTexture(GLES20.GL_TEXTURE_2D, currTexId)
+        GLES20.glUniform1i(GLES20.glGetUniformLocation(prog, "sCurrTex"), 0)
+
+        GLES20.glActiveTexture(GLES20.GL_TEXTURE1)
+        GLES20.glBindTexture(GLES20.GL_TEXTURE_2D, prevTexId)
+        GLES20.glUniform1i(GLES20.glGetUniformLocation(prog, "sPrevTex"), 1)
+
+        GLES20.glDrawArrays(GLES20.GL_TRIANGLE_STRIP, 0, 4)
+    }
+
+    private fun drawUpscaledQuad(
+        program: Int,
+        isExternalOes: Boolean,
+        textureId: Int,
+        texMat: FloatArray,
+        srcWidth: Int,
+        srcHeight: Int,
+        cfg: RenderConfig
+    ) {
+        GLES20.glUseProgram(program)
+
+        val posLoc = GLES20.glGetAttribLocation(program, "aPosition")
+        val texLoc = GLES20.glGetAttribLocation(program, "aTextureCoord")
+        val mvpLoc = GLES20.glGetUniformLocation(program, "uMVPMatrix")
+        val texMatLoc = GLES20.glGetUniformLocation(program, "uTexMatrix")
+
+        quadVertices.position(0)
+        GLES20.glVertexAttribPointer(posLoc, 2, GLES20.GL_FLOAT, false, 16, quadVertices)
+        GLES20.glEnableVertexAttribArray(posLoc)
+
+        quadVertices.position(2)
+        GLES20.glVertexAttribPointer(texLoc, 2, GLES20.GL_FLOAT, false, 16, quadVertices)
+        GLES20.glEnableVertexAttribArray(texLoc)
+
+        GLES20.glUniformMatrix4fv(mvpLoc, 1, false, mvpMatrix, 0)
+        GLES20.glUniformMatrix4fv(texMatLoc, 1, false, texMat, 0)
+        GLES20.glUniform1f(GLES20.glGetUniformLocation(program, "uOverscanCrop"), cfg.overscanCropPercent.coerceIn(0f, 0.15f))
+
+        val safeW = srcWidth.coerceAtLeast(1).toFloat()
+        val safeH = srcHeight.coerceAtLeast(1).toFloat()
+        GLES20.glUniform2f(GLES20.glGetUniformLocation(program, "uTexelSize"), 1f / safeW, 1f / safeH)
+        GLES20.glUniform2f(GLES20.glGetUniformLocation(program, "uSourceSize"), safeW, safeH)
+        GLES20.glUniform1i(GLES20.glGetUniformLocation(program, "uUpscalerMode"), cfg.filteringMode.code)
+        GLES20.glUniform1f(GLES20.glGetUniformLocation(program, "uBrightness"), cfg.brightness)
+        GLES20.glUniform1f(GLES20.glGetUniformLocation(program, "uContrast"), cfg.contrast)
+        GLES20.glUniform1f(GLES20.glGetUniformLocation(program, "uSaturation"), cfg.saturation)
+        GLES20.glUniform1f(GLES20.glGetUniformLocation(program, "uGamma"), cfg.gamma)
+        GLES20.glUniform1f(GLES20.glGetUniformLocation(program, "uSharpness"), cfg.sharpness)
+        GLES20.glUniform1i(GLES20.glGetUniformLocation(program, "uFullRange"), if (cfg.fullRangeRgb) 1 else 0)
+        GLES20.glUniform1i(GLES20.glGetUniformLocation(program, "uColorSpace"), cfg.colorSpace.code)
+        GLES20.glUniform1i(GLES20.glGetUniformLocation(program, "uShowGrid"), if (cfg.showSafeAreaGrid) 1 else 0)
 
         val filterParam = if (cfg.filteringMode == TextureFilteringMode.NEAREST_PIXEL) {
             GLES20.GL_NEAREST
@@ -1076,19 +1248,12 @@ class HardwareVideoRenderer(
             GLES20.GL_LINEAR
         }
 
-        // Bind current frame texture on unit 0
         GLES20.glActiveTexture(GLES20.GL_TEXTURE0)
-        GLES20.glBindTexture(GLES20.GL_TEXTURE_2D, currTexId)
-        GLES20.glTexParameteri(GLES20.GL_TEXTURE_2D, GLES20.GL_TEXTURE_MIN_FILTER, filterParam)
-        GLES20.glTexParameteri(GLES20.GL_TEXTURE_2D, GLES20.GL_TEXTURE_MAG_FILTER, filterParam)
-        GLES20.glUniform1i(GLES20.glGetUniformLocation(prog, "sCurrTex"), 0)
-
-        // Bind previous frame texture on unit 1 for Frame Generation optical flow
-        GLES20.glActiveTexture(GLES20.GL_TEXTURE1)
-        GLES20.glBindTexture(GLES20.GL_TEXTURE_2D, prevTexId)
-        GLES20.glTexParameteri(GLES20.GL_TEXTURE_2D, GLES20.GL_TEXTURE_MIN_FILTER, filterParam)
-        GLES20.glTexParameteri(GLES20.GL_TEXTURE_2D, GLES20.GL_TEXTURE_MAG_FILTER, filterParam)
-        GLES20.glUniform1i(GLES20.glGetUniformLocation(prog, "sPrevTex"), 1)
+        val bindTarget = if (isExternalOes) GLES11Ext.GL_TEXTURE_EXTERNAL_OES else GLES20.GL_TEXTURE_2D
+        GLES20.glBindTexture(bindTarget, textureId)
+        GLES20.glTexParameteri(bindTarget, GLES20.GL_TEXTURE_MIN_FILTER, filterParam)
+        GLES20.glTexParameteri(bindTarget, GLES20.GL_TEXTURE_MAG_FILTER, filterParam)
+        GLES20.glUniform1i(GLES20.glGetUniformLocation(program, "sTexture"), 0)
 
         GLES20.glDrawArrays(GLES20.GL_TRIANGLE_STRIP, 0, 4)
     }
@@ -1140,12 +1305,12 @@ class HardwareVideoRenderer(
     }
 
     /**
-     * Picks the stream size the card really supports: exact match, else the closest area with the
-     * same aspect ratio, else the closest area overall. Prevents configure failures (= endless No Signal)
-     * when a requested custom resolution is not natively offered by the capture card.
+     * Picks the stream size the card supports:
+     * - Tier 0 / 1: Exact match for `mode.width × mode.height` (default 1920×1080), else closest aspect/area.
+     * - Tier 2 (universal fallback): 1280×720 or the card's first native output size.
      */
-    private fun chooseCaptureSize(chars: CameraCharacteristics, mode: VideoMode): Size {
-        val wanted = Size(mode.width, mode.height)
+    private fun chooseCaptureSize(chars: CameraCharacteristics, mode: VideoMode, tier: Int): Size {
+        val wanted = if (tier >= 2) Size(1280, 720) else Size(mode.width, mode.height)
         val sizes = try {
             chars.get(CameraCharacteristics.SCALER_STREAM_CONFIGURATION_MAP)
                 ?.getOutputSizes(SurfaceTexture::class.java)
@@ -1154,101 +1319,152 @@ class HardwareVideoRenderer(
         }
         if (sizes == null || sizes.isEmpty()) return wanted
         sizes.firstOrNull { it.width == wanted.width && it.height == wanted.height }?.let { return it }
+        if (tier >= 2) {
+            sizes.firstOrNull { it.width == 1920 && it.height == 1080 }?.let { return it }
+            return sizes.first()
+        }
         val wantedArea = wanted.width.toLong() * wanted.height
         val wantedAspect = wanted.width.toFloat() / wanted.height
-        val sameAspect = sizes.filter { kotlin.math.abs(it.width.toFloat() / it.height - wantedAspect) < 0.02f }
+        val sameAspect = sizes.filter { abs(it.width.toFloat() / it.height - wantedAspect) < 0.02f }
         val pool = if (sameAspect.isNotEmpty()) sameAspect else sizes.toList()
-        return pool.minByOrNull { kotlin.math.abs(it.width.toLong() * it.height - wantedArea) } ?: wanted
+        return pool.minByOrNull { abs(it.width.toLong() * it.height - wantedArea) } ?: wanted
     }
 
-    private fun chooseFpsRange(chars: CameraCharacteristics, fps: Int): Range<Int>? {
+    /**
+     * Picks the most flexible FPS range covering `fps` (prefers lowest `lower` bound so variable
+     * 24/25/29.97/30/50/60Hz HDMI inputs are never rejected by Android's UVC ExternalCameraHAL).
+     */
+    private fun chooseFlexibleFpsRange(chars: CameraCharacteristics, fps: Int): Range<Int>? {
         val ranges = try {
             chars.get(CameraCharacteristics.CONTROL_AE_AVAILABLE_TARGET_FPS_RANGES)
         } catch (_: Exception) {
             null
         }
         if (ranges == null || ranges.isEmpty()) return null
-        val bestUpper = ranges.minOf { kotlin.math.abs(it.upper - fps) }
-        return ranges.filter { kotlin.math.abs(it.upper - fps) == bestUpper }.maxByOrNull { it.lower }
+        val bestUpperDiff = ranges.minOf { abs(it.upper - fps) }
+        return ranges
+            .filter { abs(it.upper - fps) == bestUpperDiff }
+            .minByOrNull { it.lower }
     }
 
-    private fun scheduleStreamRetry(generation: Int) {
+    private fun scheduleStreamRetry(generation: Int, advanceFallbackTier: Boolean, delayMs: Long = 2200L) {
         mainHandler.postDelayed({
             if (generation == streamGeneration && !capturePaused &&
                 activeCameraId != null && hasCameraPermissionFlag
             ) {
-                requestStartStream()
+                if (advanceFallbackTier) {
+                    fallbackTier = (fallbackTier + 1) % 3
+                }
+                startCamera2StreamInternal()
             }
-        }, 2000L)
+        }, delayMs)
     }
 
-    /** Must run on the main thread (always reached through [requestStartStream]). */
     @SuppressLint("MissingPermission")
-    private fun startCamera2Stream() {
+    private fun startCamera2StreamInternal() {
         val cameraId = activeCameraId ?: return
-        val surface = captureSurface ?: return
+        val surface = synchronized(cameraLock) { captureSurface } ?: return
         if (capturePaused || !hasCameraPermissionFlag) return
         val mode = activeMode
+        val tier = fallbackTier
 
-        stopCamera2Stream()
+        stopCamera2StreamSync()
         val generation = ++streamGeneration
         cameraOpenRequested = true
         hasReceivedAnyCameraFrame = false
+        receivedCameraFrames = 0L
         blankSignal = false
         blankSinceNs = 0L
 
         val thread = HandlerThread("UvcCamera2Thread").also { it.start() }
         val handler = Handler(thread.looper)
-        cameraThread = thread
-        cameraHandler = handler
+        synchronized(cameraLock) {
+            cameraThread = thread
+            cameraHandler = handler
+        }
 
         try {
             val camManager = context.getSystemService(Context.CAMERA_SERVICE) as CameraManager
             val chars = camManager.getCameraCharacteristics(cameraId)
-            val size = chooseCaptureSize(chars, mode)
-            val fpsRange = chooseFpsRange(chars, mode.fps)
+            val size = chooseCaptureSize(chars, mode, tier)
+            val fpsRange = if (tier == 0) chooseFlexibleFpsRange(chars, mode.fps) else null
             captureWidth = size.width
             captureHeight = size.height
-            surfaceTexture?.setDefaultBufferSize(size.width, size.height)
+            synchronized(cameraLock) {
+                surfaceTexture?.setDefaultBufferSize(size.width, size.height)
+            }
 
             camManager.openCamera(cameraId, object : CameraDevice.StateCallback() {
                 override fun onOpened(camera: CameraDevice) {
                     if (generation != streamGeneration) {
-                        camera.close()
+                        try {
+                            camera.close()
+                        } catch (_: Exception) {
+                        }
                         return
                     }
-                    openedCamera = camera
+                    synchronized(cameraLock) {
+                        openedCamera = camera
+                    }
                     try {
-                        val requestBuilder = camera.createCaptureRequest(CameraDevice.TEMPLATE_RECORD).apply {
+                        // Prefer TEMPLATE_PREVIEW (standard for Android External UVC Camera HAL), fallback to TEMPLATE_RECORD
+                        val requestBuilder = try {
+                            if (tier <= 1) {
+                                camera.createCaptureRequest(CameraDevice.TEMPLATE_PREVIEW)
+                            } else {
+                                camera.createCaptureRequest(CameraDevice.TEMPLATE_RECORD)
+                            }
+                        } catch (_: Exception) {
+                            camera.createCaptureRequest(CameraDevice.TEMPLATE_PREVIEW)
+                        }.apply {
                             addTarget(surface)
                             if (fpsRange != null) {
-                                set(CaptureRequest.CONTROL_AE_TARGET_FPS_RANGE, fpsRange)
+                                try {
+                                    set(CaptureRequest.CONTROL_AE_TARGET_FPS_RANGE, fpsRange)
+                                } catch (_: Exception) {
+                                }
                             }
                         }
+
                         @Suppress("DEPRECATION")
                         camera.createCaptureSession(
                             listOf(surface),
                             object : CameraCaptureSession.StateCallback() {
                                 override fun onConfigured(session: CameraCaptureSession) {
                                     if (generation != streamGeneration) {
-                                        session.close()
+                                        try {
+                                            session.close()
+                                        } catch (_: Exception) {
+                                        }
                                         return
                                     }
-                                    captureSession = session
+                                    synchronized(cameraLock) {
+                                        captureSession = session
+                                    }
                                     try {
                                         session.setRepeatingRequest(requestBuilder.build(), null, handler)
                                         useLiveCameraStream = true
+                                        // Watchdog: if 0 frames arrive within 3.0s on Tier 0, automatically try unconstrained FPS (Tier 1)
+                                        if (tier == 0) {
+                                            mainHandler.postDelayed({
+                                                if (generation == streamGeneration && receivedCameraFrames == 0L && !capturePaused) {
+                                                    Log.i(TAG, "No UVC frames at tier 0 (${size.width}x${size.height} @ $fpsRange); retrying unconstrained UVC stream")
+                                                    fallbackTier = 1
+                                                    startCamera2StreamInternal()
+                                                }
+                                            }, 3000L)
+                                        }
                                     } catch (e: Exception) {
                                         Log.w(TAG, "Repeating request error: ${e.message}")
                                         useLiveCameraStream = false
-                                        scheduleStreamRetry(generation)
+                                        scheduleStreamRetry(generation, advanceFallbackTier = true)
                                     }
                                 }
 
                                 override fun onConfigureFailed(session: CameraCaptureSession) {
-                                    Log.w(TAG, "Camera2 session configure failed for ${size.width}x${size.height}")
+                                    Log.w(TAG, "Camera2 session configure failed for ${size.width}x${size.height} (tier $tier)")
                                     useLiveCameraStream = false
-                                    scheduleStreamRetry(generation)
+                                    scheduleStreamRetry(generation, advanceFallbackTier = true, delayMs = 800L)
                                 }
                             },
                             handler
@@ -1256,45 +1472,48 @@ class HardwareVideoRenderer(
                     } catch (e: Exception) {
                         Log.w(TAG, "Session creation error: ${e.message}")
                         useLiveCameraStream = false
-                        scheduleStreamRetry(generation)
+                        scheduleStreamRetry(generation, advanceFallbackTier = true)
                     }
                 }
 
                 override fun onDisconnected(camera: CameraDevice) {
                     useLiveCameraStream = false
                     hasReceivedAnyCameraFrame = false
-                    camera.close()
+                    receivedCameraFrames = 0L
+                    try {
+                        camera.close()
+                    } catch (_: Exception) {
+                    }
                     if (generation == streamGeneration) {
                         cameraOpenRequested = false
-                        scheduleStreamRetry(generation)
+                        scheduleStreamRetry(generation, advanceFallbackTier = false)
                     }
                 }
 
                 override fun onError(camera: CameraDevice, error: Int) {
-                    Log.w(TAG, "Camera error $error")
+                    Log.w(TAG, "Camera error $error (tier $tier)")
                     useLiveCameraStream = false
                     hasReceivedAnyCameraFrame = false
-                    camera.close()
+                    receivedCameraFrames = 0L
+                    try {
+                        camera.close()
+                    } catch (_: Exception) {
+                    }
                     if (generation == streamGeneration) {
                         cameraOpenRequested = false
-                        scheduleStreamRetry(generation)
+                        scheduleStreamRetry(generation, advanceFallbackTier = true)
                     }
                 }
             }, handler)
         } catch (e: Exception) {
             Log.w(TAG, "Unable to open camera $cameraId: ${e.message}")
             useLiveCameraStream = false
-            scheduleStreamRetry(generation)
+            scheduleStreamRetry(generation, advanceFallbackTier = true)
         }
     }
 
-    /**
-     * Reads a 4x4 grid of pixels from the frame just rendered into the bound history FBO.
-     * A perfectly uniform dark or solid-blue picture held for >1.5 s is what capture cards output
-     * when no HDMI source is attached, so it is reported as No Signal. Runs at ~2.5 Hz (negligible cost).
-     */
     private fun sampleBlankSignal(nowNs: Long) {
-        if (nowNs - lastBlankSampleNs < 400_000_000L) return
+        if (nowNs - lastBlankSampleNs < 800_000_000L) return
         lastBlankSampleNs = nowNs
         val w = historyBufferWidth
         val h = historyBufferHeight
@@ -1303,10 +1522,10 @@ class HardwareVideoRenderer(
         var minR = 255; var minG = 255; var minB = 255
         var maxR = 0; var maxG = 0; var maxB = 0
         var sumR = 0; var sumG = 0; var sumB = 0
-        for (gy in 0 until 4) {
-            for (gx in 0 until 4) {
-                val x = ((gx + 0.5f) / 4f * w).toInt().coerceIn(0, w - 1)
-                val y = ((gy + 0.5f) / 4f * h).toInt().coerceIn(0, h - 1)
+        for (gy in 1..2) {
+            for (gx in 1..2) {
+                val x = (gx * w / 3).coerceIn(0, w - 1)
+                val y = (gy * h / 3).coerceIn(0, h - 1)
                 blankPixel.clear()
                 GLES20.glReadPixels(x, y, 1, 1, GLES20.GL_RGBA, GLES20.GL_UNSIGNED_BYTE, blankPixel)
                 val r = blankPixel.get(0).toInt() and 0xFF
@@ -1317,62 +1536,68 @@ class HardwareVideoRenderer(
                 minB = min(minB, b); maxB = max(maxB, b); sumB += b
             }
         }
-        val uniform = (maxR - minR) <= 8 && (maxG - minG) <= 8 && (maxB - minB) <= 8
-        val avgR = sumR / 16
-        val avgG = sumG / 16
-        val avgB = sumB / 16
+        val uniform = (maxR - minR) <= 4 && (maxG - minG) <= 4 && (maxB - minB) <= 4
+        val avgR = sumR / 4
+        val avgG = sumG / 4
+        val avgB = sumB / 4
         val luma = (avgR * 0.2126f + avgG * 0.7152f + avgB * 0.0722f)
-        val dark = luma <= 26f
-        val blue = avgB - max(avgR, avgG) >= 40
+        val dark = luma <= 8f
+        val blue = avgB - max(avgR, avgG) >= 65
         val blankNow = uniform && (dark || blue)
 
         if (blankNow) {
             if (blankSinceNs == 0L) blankSinceNs = nowNs
-            if (nowNs - blankSinceNs >= 1_500_000_000L) blankSignal = true
+            if (nowNs - blankSinceNs >= 2_000_000_000L) blankSignal = true
         } else {
             blankSinceNs = 0L
             blankSignal = false
         }
     }
 
-    /** Closes the camera session + device. Must run on the main thread. */
-    fun stopCamera2Stream() {
-        streamGeneration++
-        cameraOpenRequested = false
-        useLiveCameraStream = false
-        hasReceivedAnyCameraFrame = false
+    fun stopCamera2StreamSync() {
+        synchronized(cameraLock) {
+            streamGeneration++
+            cameraOpenRequested = false
+            useLiveCameraStream = false
+            hasReceivedAnyCameraFrame = false
+            receivedCameraFrames = 0L
 
-        try {
-            captureSession?.close()
-        } catch (_: Exception) {
-        }
-        captureSession = null
+            try {
+                captureSession?.close()
+            } catch (_: Exception) {
+            }
+            captureSession = null
 
-        try {
-            openedCamera?.close()
-        } catch (_: Exception) {
-        }
-        openedCamera = null
+            try {
+                openedCamera?.close()
+            } catch (_: Exception) {
+            }
+            openedCamera = null
 
-        try {
-            cameraThread?.quitSafely()
-        } catch (_: Exception) {
+            try {
+                cameraThread?.quitSafely()
+            } catch (_: Exception) {
+            }
+            cameraThread = null
+            cameraHandler = null
         }
-        cameraThread = null
-        cameraHandler = null
     }
 
     fun release() {
         capturePaused = true
         mainHandler.removeCallbacksAndMessages(null)
-        stopCamera2Stream()
-        try {
-            captureSurface?.release()
-        } catch (_: Exception) {
-        }
-        try {
-            surfaceTexture?.release()
-        } catch (_: Exception) {
+        stopCamera2StreamSync()
+        synchronized(cameraLock) {
+            try {
+                captureSurface?.release()
+            } catch (_: Exception) {
+            }
+            captureSurface = null
+            try {
+                surfaceTexture?.release()
+            } catch (_: Exception) {
+            }
+            surfaceTexture = null
         }
     }
 
