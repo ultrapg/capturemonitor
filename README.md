@@ -6,6 +6,18 @@ Built as a clean, zero-bloat, open-source alternative to apps like **Noir**, wit
 
 ---
 
+## What's new in v0.6.3
+
+- **Ultra-Low-Latency Decoupled USB UVC Pipeline (`UvcUsbStreamEngine`)**:
+  - **Separated Real-Time USB URB Reaping from Frame Decoding**: Dedicated high-priority `UvcUsbReapThread` (`THREAD_PRIORITY_URGENT_AUDIO`) uses blocking Linux kernel hardware interrupt wakeup (`USBDEVFS_REAPURB`) + batch drain (`USBDEVFS_REAPURBNDELAY`) with 12 in-flight URBs and zero `Thread.sleep` polling, writing raw packet payloads into a lock-free 3-slot ring (`RawFrameSlot[0..2]`).
+  - **Zero-Queue-Latency Latest-Frame Decoder (`UvcFrameDecodeThread`)**: Wakes in nanoseconds via `LockSupport.unpark()` as soon as an End-of-Frame arrives and always decodes the newest frame (`latestReadySlot.getAndSet(-1)`), eliminating frame queue buildup.
+  - **Zero-Copy `Bitmap` -> `GLUtils.texSubImage2D` GPU Upload**: Eliminates the 8.3 MB `copyPixelsToBuffer` CPU copy per frame and decodes MJPEG into a reusable triple-buffered `RGB_565` / `ARGB_8888` `Bitmap` ring uploaded directly from native Skia memory to the GPU.
+- **True 60Hz / 120Hz+ Capture Card Refresh Rate Lock**:
+  - Enforces `dwFrameInterval` in both `VS_PROBE_CONTROL` and `VS_COMMIT_CONTROL`, prioritizes high-bandwidth Isochronous alternate settings (`3072 bytes/microframe` = 24 MB/s), and selects format descriptors that genuinely support the target 60Hz / 120Hz refresh rate.
+  - Fixed a bug where `startDevicePolling()` and `forceUvcStreamNegotiation()` opened competing `UsbDeviceConnection` handles every 2 seconds or on mode changes, which previously reset the USB VideoStreaming interface and throttled frame rate to ~15 FPS.
+- **Event-Driven `RENDERMODE_WHEN_DIRTY` Display Presentation**:
+  - Uses `RENDERMODE_WHEN_DIRTY` when Frame Generation is off so `eglSwapBuffers()` is only called when a fresh capture card frame arrives—preventing duplicate frames from filling Android's 3-slot `SurfaceFlinger` `BufferQueue` and cutting 33–50 ms of display queue latency.
+
 ## What's new in v0.6.2
 
 - **Never Opens the Phone's Built-in Camera**:

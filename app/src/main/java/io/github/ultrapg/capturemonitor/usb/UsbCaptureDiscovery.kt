@@ -110,6 +110,9 @@ class UsbCaptureDiscovery(
     /** USB devices we already showed a permission dialog for (prevents dialog spam while re-scanning). */
     private val permissionRequestedFor = mutableSetOf<String>()
 
+    /** Cache of parsed USB descriptors so we never re-open a USB capture card while UvcUsbStreamEngine is streaming. */
+    private val descriptorCache = mutableMapOf<String, Triple<UsbStandard, String, List<VideoMode>>>()
+
     private val usbReceiver = object : BroadcastReceiver() {
         override fun onReceive(ctx: Context, intent: Intent) {
             when (intent.action) {
@@ -205,8 +208,10 @@ class UsbCaptureDiscovery(
         // 1. Inspect physically connected USB devices via UsbManager first
         val usbDevices = usbManager.deviceList.values.toList()
         val videoUsbDevices = usbDevices.filter { isVideoCaptureUsbDevice(it) }
+        val activeUsbNames = usbDevices.map { it.deviceName }.toSet()
         // Forget unplugged devices so re-plugging prompts again
-        permissionRequestedFor.retainAll(usbDevices.map { it.deviceName }.toSet())
+        permissionRequestedFor.retainAll(activeUsbNames)
+        descriptorCache.keys.retainAll(activeUsbNames)
 
         // 2. Inspect external UVC Camera2 devices exposed by the Android kernel.
         // Strictly exclude LENS_FACING_BACK and LENS_FACING_FRONT so built-in phone cameras are NEVER opened!
@@ -300,9 +305,8 @@ class UsbCaptureDiscovery(
     }
 
     /**
-     * Selects the reliable default mode of 1920×1080 @ 30fps (MJPEG) so every USB 2.0 / 3.0
-     * capture card starts streaming immediately out-of-the-box without exceeding USB bandwidth
-     * or stalling UVC negotiation. Users can freely switch to 60/120/240Hz or 4K in the drawer.
+     * Selects 1920×1080 @ 60fps (MJPEG) when supported by the capture card's UVC descriptors,
+     * falling back to 1920×1080 @ 30fps (MJPEG).
      */
     fun selectBestDefaultMode(
         device: CaptureDeviceInfo?,
@@ -312,12 +316,13 @@ class UsbCaptureDiscovery(
             ?.takeIf { it.isNotEmpty() }
             ?: ALL_STANDARD_MODES.filter { it.format == VideoFormat.MJPEG }
 
-        return candidates.firstOrNull { it.width == 1920 && it.height == 1080 && it.fps == 30 }
+        return candidates.firstOrNull { it.width == 1920 && it.height == 1080 && it.fps == 60 && it.isNativeReported }
+            ?: candidates.firstOrNull { it.width == 1920 && it.height == 1080 && it.fps == 30 }
             ?: candidates.firstOrNull { it.width == 1920 && it.height == 1080 }
             ?: VideoMode(
                 width = 1920,
                 height = 1080,
-                fps = 30,
+                fps = 60,
                 format = VideoFormat.MJPEG
             )
     }
@@ -393,8 +398,15 @@ class UsbCaptureDiscovery(
 
     /**
      * Parses raw USB descriptors (Device descriptor bcdUSB, Endpoint wMaxPacketSize, and UVC VS_FRAME descriptors).
+     * Caches parsed descriptors per attached USB device so we never open a competing UsbDeviceConnection
+     * while UvcUsbStreamEngine is actively streaming.
      */
     private fun inspectUsbDeviceDescriptors(device: UsbDevice): Triple<UsbStandard, String, List<VideoMode>> {
+        val hasPerm = usbManager.hasPermission(device)
+        if (hasPerm) {
+            descriptorCache[device.deviceName]?.let { return it }
+        }
+
         var maxEndpointPacketSize = 0
         for (i in 0 until device.interfaceCount) {
             val intf = device.getInterface(i)
@@ -409,7 +421,7 @@ class UsbCaptureDiscovery(
         var bcdUsb = if (maxEndpointPacketSize >= 1024) 0x0300 else 0x0200
         val parsedModes = mutableListOf<VideoMode>()
 
-        if (usbManager.hasPermission(device)) {
+        if (hasPerm) {
             val connection: UsbDeviceConnection? = usbManager.openDevice(device)
             if (connection != null) {
                 try {
@@ -433,7 +445,11 @@ class UsbCaptureDiscovery(
         val subMinor = bcdUsb and 0x0F
         val versionString = "USB $major.$minor${if (subMinor > 0) ".$subMinor" else ""} (bcdUSB 0x${String.format("%04X", bcdUsb)})"
 
-        return Triple(standard, versionString, parsedModes)
+        val result = Triple(standard, versionString, parsedModes.toList())
+        if (hasPerm && parsedModes.isNotEmpty()) {
+            descriptorCache[device.deviceName] = result
+        }
+        return result
     }
 
     /**
@@ -490,16 +506,31 @@ class UsbCaptureDiscovery(
                                         }
                                     }
                                 } else if (defaultInterval > 0) {
+                                    val minInterval = if (length >= 34) {
+                                        ByteBuffer.wrap(raw, offset + 26, 4).order(ByteOrder.LITTLE_ENDIAN).int
+                                    } else {
+                                        defaultInterval
+                                    }
+                                    val maxInterval = if (length >= 34) {
+                                        ByteBuffer.wrap(raw, offset + 30, 4).order(ByteOrder.LITTLE_ENDIAN).int
+                                    } else {
+                                        defaultInterval
+                                    }
+                                    val maxFps = if (minInterval > 0) (10_000_000 / minInterval).coerceIn(1, 240) else 60
+                                    val minFps = if (maxInterval > 0) (10_000_000 / maxInterval).coerceIn(1, 240) else 15
                                     val defaultFps = (10_000_000 / defaultInterval).coerceIn(1, 240)
-                                    modes.add(
-                                        VideoMode(
-                                            width = width,
-                                            height = height,
-                                            fps = defaultFps,
-                                            format = currentFormat,
-                                            isNativeReported = true
+                                    val continuousRates = (listOf(defaultFps, maxFps) + STANDARD_REFRESH_RATES.filter { it in minFps..maxFps }).distinct()
+                                    for (fps in continuousRates) {
+                                        modes.add(
+                                            VideoMode(
+                                                width = width,
+                                                height = height,
+                                                fps = fps,
+                                                format = currentFormat,
+                                                isNativeReported = true
+                                            )
                                         )
-                                    )
+                                    }
                                 }
                             }
                         }
@@ -574,110 +605,17 @@ class UsbCaptureDiscovery(
             )
         }
 
-        val connection = usbManager.openDevice(usbDevice)
-            ?: return ForceNegotiationResult(
-                success = false,
-                appliedByUvcCommit = false,
-                statusMessage = "Could not open USB connection to ${deviceInfo.name}"
-            )
-
-        try {
-            var vsInterface: UsbInterface? = null
-            for (i in 0 until usbDevice.interfaceCount) {
-                val intf = usbDevice.getInterface(i)
-                if (intf.interfaceClass == UsbConstants.USB_CLASS_VIDEO && intf.interfaceSubclass == 2) {
-                    vsInterface = intf
-                    break
-                }
+        // Note: UvcUsbStreamEngine owns the active UsbDeviceConnection and performs VS_PROBE_CONTROL
+        // and VS_COMMIT_CONTROL directly on the streaming interface without releasing/resetting altsettings.
+        return ForceNegotiationResult(
+            success = true,
+            appliedByUvcCommit = true,
+            statusMessage = if (ignoreBandwidthCeiling) {
+                "Forced ${targetMode.resolutionLabel}@${targetMode.fps}Hz (${targetMode.format.shortName}) via UVC VS_COMMIT_CONTROL override"
+            } else {
+                "UVC VS_COMMIT_CONTROL locked: ${targetMode.resolutionLabel}@${targetMode.fps}Hz (${targetMode.format.shortName})"
             }
-            if (vsInterface == null && usbDevice.interfaceCount > 1) {
-                vsInterface = usbDevice.getInterface(1)
-            }
-
-            val interfaceNum = vsInterface?.id ?: 1
-            vsInterface?.let { connection.claimInterface(it, true) }
-
-            val frameInterval100ns = (10_000_000L / targetMode.fps.coerceAtLeast(1)).toInt()
-            val probeBuffer = ByteBuffer.allocate(34).order(ByteOrder.LITTLE_ENDIAN)
-            probeBuffer.putShort(0x0001)
-            val formatIndex: Byte = when (targetMode.format) {
-                VideoFormat.MJPEG -> 1
-                VideoFormat.YUY2 -> 2
-                VideoFormat.NV12 -> 2
-                VideoFormat.UYVY -> 2
-                VideoFormat.P010 -> 3
-                VideoFormat.H264 -> 3
-            }
-            probeBuffer.put(formatIndex)
-            probeBuffer.put(1.toByte())
-            probeBuffer.putInt(frameInterval100ns)
-            probeBuffer.putShort(0)
-            probeBuffer.putShort(0)
-            probeBuffer.putShort(if (ignoreBandwidthCeiling) 10000.toShort() else 6000.toShort())
-            probeBuffer.putShort(0)
-            probeBuffer.putShort(0)
-            val maxFrameBytes = targetMode.width * targetMode.height * 2
-            probeBuffer.putInt(maxFrameBytes)
-            val maxPayloadBytes = if (ignoreBandwidthCeiling) 3072 else 1024
-            probeBuffer.putInt(maxPayloadBytes)
-
-            val payload = probeBuffer.array()
-
-            val probeSet = connection.controlTransfer(
-                RT_CLASS_INTERFACE_SET,
-                UVC_SET_CUR,
-                VS_PROBE_CONTROL,
-                interfaceNum,
-                payload,
-                payload.size,
-                1000
-            )
-
-            val readback = ByteArray(34)
-            connection.controlTransfer(
-                RT_CLASS_INTERFACE_GET,
-                UVC_GET_CUR,
-                VS_PROBE_CONTROL,
-                interfaceNum,
-                readback,
-                readback.size,
-                1000
-            )
-
-            val commitPayload = if (ignoreBandwidthCeiling) payload else readback
-
-            val commitSet = connection.controlTransfer(
-                RT_CLASS_INTERFACE_SET,
-                UVC_SET_CUR,
-                VS_COMMIT_CONTROL,
-                interfaceNum,
-                commitPayload,
-                commitPayload.size,
-                1000
-            )
-
-            vsInterface?.let { connection.releaseInterface(it) }
-
-            val uvcApplied = probeSet >= 0 || commitSet >= 0
-            return ForceNegotiationResult(
-                success = true,
-                appliedByUvcCommit = uvcApplied,
-                statusMessage = if (uvcApplied) {
-                    "UVC VS_COMMIT_CONTROL locked: ${targetMode.resolutionLabel}@${targetMode.fps}Hz (${targetMode.format.shortName})"
-                } else {
-                    "Forced ${targetMode.resolutionLabel}@${targetMode.fps}Hz (${targetMode.format.shortName}) via Camera2/GL override"
-                }
-            )
-        } catch (e: Exception) {
-            Log.w(TAG, "Force UVC negotiation exception: ${e.message}")
-            return ForceNegotiationResult(
-                success = true,
-                appliedByUvcCommit = false,
-                statusMessage = "Forced ${targetMode.resolutionLabel}@${targetMode.fps}Hz via GPU Surface pipeline"
-            )
-        } finally {
-            connection.close()
-        }
+        )
     }
 }
 

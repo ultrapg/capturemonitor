@@ -2,6 +2,7 @@ package io.github.ultrapg.capturemonitor.gl
 
 import android.annotation.SuppressLint
 import android.content.Context
+import android.graphics.Bitmap
 import android.graphics.SurfaceTexture
 import android.hardware.camera2.CameraCaptureSession
 import android.hardware.camera2.CameraCharacteristics
@@ -11,6 +12,7 @@ import android.hardware.camera2.CaptureRequest
 import android.opengl.GLES11Ext
 import android.opengl.GLES20
 import android.opengl.GLSurfaceView
+import android.opengl.GLUtils
 import android.opengl.Matrix
 import android.os.Handler
 import android.os.HandlerThread
@@ -26,6 +28,7 @@ import io.github.ultrapg.capturemonitor.model.FrameGenMultiplier
 import io.github.ultrapg.capturemonitor.model.RenderConfig
 import io.github.ultrapg.capturemonitor.model.TextureFilteringMode
 import io.github.ultrapg.capturemonitor.model.VideoMode
+import io.github.ultrapg.capturemonitor.usb.DecodedUsbFrame
 import io.github.ultrapg.capturemonitor.usb.UvcUsbStreamEngine
 import java.nio.ByteBuffer
 import java.nio.ByteOrder
@@ -649,20 +652,12 @@ class HardwareVideoRenderer(
     private var usbStreamTexId = 0
     private var usbStreamTexWidth = 0
     private var usbStreamTexHeight = 0
+    private var usbStreamTexConfig: Bitmap.Config? = null
 
     private val usbFrameLock = Any()
 
     @Volatile
-    private var pendingUsbRgbaBuffer: ByteBuffer? = null
-
-    @Volatile
-    private var pendingUsbWidth = 1920
-
-    @Volatile
-    private var pendingUsbHeight = 1080
-
-    @Volatile
-    private var pendingUsbBlankSignal = false
+    private var pendingUsbFrame: DecodedUsbFrame? = null
 
     @Volatile
     private var usbFrameAvailable = false
@@ -726,16 +721,39 @@ class HardwareVideoRenderer(
     private val cameraLock = Any()
     private val mainHandler = Handler(Looper.getMainLooper())
 
-    private val uvcUsbStreamEngine = UvcUsbStreamEngine(context) { rgbaBuffer, width, height, isBlank ->
+    private val uvcUsbStreamEngine = UvcUsbStreamEngine(context) { decodedFrame ->
         synchronized(usbFrameLock) {
-            pendingUsbRgbaBuffer = rgbaBuffer
-            pendingUsbWidth = width
-            pendingUsbHeight = height
-            pendingUsbBlankSignal = isBlank
+            pendingUsbFrame = decodedFrame
             usbFrameAvailable = true
         }
         lastCameraFrameNs = System.nanoTime()
         glSurfaceView.requestRender()
+    }
+
+    private val idleHeartbeatRunnable = object : Runnable {
+        override fun run() {
+            if (capturePaused) return
+            val now = System.nanoTime()
+            if (now - lastFrameTimestampNs >= 280_000_000L) {
+                glSurfaceView.requestRender()
+            }
+            mainHandler.postDelayed(this, 320L)
+        }
+    }
+
+    private fun syncLowLatencyRenderMode(cfg: RenderConfig) {
+        val wantContinuous = cfg.frameGenMode != FrameGenMode.OFF || cfg.showTestPatternWhenNoSignal
+        val targetRenderMode = if (wantContinuous) {
+            GLSurfaceView.RENDERMODE_CONTINUOUSLY
+        } else {
+            GLSurfaceView.RENDERMODE_WHEN_DIRTY
+        }
+        try {
+            if (glSurfaceView.renderMode != targetRenderMode) {
+                glSurfaceView.renderMode = targetRenderMode
+            }
+        } catch (_: Exception) {
+        }
     }
 
     @Volatile
@@ -775,6 +793,8 @@ class HardwareVideoRenderer(
 
     fun updateRenderConfig(config: RenderConfig) {
         renderConfig = config
+        syncLowLatencyRenderMode(config)
+        glSurfaceView.requestRender()
     }
 
     fun bindSource(device: CaptureDeviceInfo?, mode: VideoMode, hasCameraPermission: Boolean) {
@@ -821,6 +841,9 @@ class HardwareVideoRenderer(
     /** Re-opens the capture card stream when the app returns to the foreground. */
     fun resumeCapture() {
         capturePaused = false
+        syncLowLatencyRenderMode(renderConfig)
+        mainHandler.removeCallbacks(idleHeartbeatRunnable)
+        mainHandler.postDelayed(idleHeartbeatRunnable, 320L)
         if (activeDevice != null) {
             fallbackTier = 0
             startCaptureStreamsForActiveDevice()
@@ -829,6 +852,7 @@ class HardwareVideoRenderer(
 
     private fun startCaptureStreamsForActiveDevice() {
         mainHandler.removeCallbacksAndMessages(null)
+        mainHandler.postDelayed(idleHeartbeatRunnable, 320L)
         val device = activeDevice ?: return
         val mode = activeMode
         hasReceivedAnyUsbFrame = false
@@ -888,6 +912,7 @@ class HardwareVideoRenderer(
         usbStreamTexId = texIds[1]
         usbStreamTexWidth = 0
         usbStreamTexHeight = 0
+        usbStreamTexConfig = null
 
         GLES20.glBindTexture(GLES11Ext.GL_TEXTURE_EXTERNAL_OES, oesTextureId)
         GLES20.glTexParameterf(GLES11Ext.GL_TEXTURE_EXTERNAL_OES, GLES20.GL_TEXTURE_MIN_FILTER, GLES20.GL_LINEAR.toFloat())
@@ -988,45 +1013,59 @@ class HardwareVideoRenderer(
         val fgEnabled = cfg.frameGenMode != FrameGenMode.OFF && frameGenProgram != 0 && tex2dUpscaleProgram != 0
 
         if (usbFrameAvailable) {
-            var uploadBuf: ByteBuffer? = null
-            var w = 0
-            var h = 0
-            var isBlank = false
+            var frame: DecodedUsbFrame? = null
             synchronized(usbFrameLock) {
                 if (usbFrameAvailable) {
                     usbFrameAvailable = false
-                    uploadBuf = pendingUsbRgbaBuffer
-                    w = pendingUsbWidth
-                    h = pendingUsbHeight
-                    isBlank = pendingUsbBlankSignal
+                    frame = pendingUsbFrame
                 }
             }
-            if (uploadBuf != null && w > 0 && h > 0) {
-                uploadBuf!!.position(0)
+            val decoded = frame
+            if (decoded != null && decoded.width > 0 && decoded.height > 0) {
+                val w = decoded.width
+                val h = decoded.height
                 GLES20.glActiveTexture(GLES20.GL_TEXTURE0)
                 GLES20.glBindTexture(GLES20.GL_TEXTURE_2D, usbStreamTexId)
-                if (w != usbStreamTexWidth || h != usbStreamTexHeight) {
-                    usbStreamTexWidth = w
-                    usbStreamTexHeight = h
-                    GLES20.glTexImage2D(
-                        GLES20.GL_TEXTURE_2D, 0, GLES20.GL_RGBA,
-                        w, h, 0,
-                        GLES20.GL_RGBA, GLES20.GL_UNSIGNED_BYTE, uploadBuf
-                    )
-                } else {
-                    GLES20.glTexSubImage2D(
-                        GLES20.GL_TEXTURE_2D, 0, 0, 0,
-                        w, h,
-                        GLES20.GL_RGBA, GLES20.GL_UNSIGNED_BYTE, uploadBuf
-                    )
+
+                val bmp = decoded.bitmap
+                val rgbaBuf = decoded.rgbaBuffer
+                if (bmp != null && !bmp.isRecycled) {
+                    val cfgBmp = bmp.config ?: Bitmap.Config.RGB_565
+                    if (w != usbStreamTexWidth || h != usbStreamTexHeight || cfgBmp != usbStreamTexConfig) {
+                        usbStreamTexWidth = w
+                        usbStreamTexHeight = h
+                        usbStreamTexConfig = cfgBmp
+                        GLUtils.texImage2D(GLES20.GL_TEXTURE_2D, 0, bmp, 0)
+                    } else {
+                        GLUtils.texSubImage2D(GLES20.GL_TEXTURE_2D, 0, 0, 0, bmp)
+                    }
+                } else if (rgbaBuf != null) {
+                    rgbaBuf.position(0)
+                    if (w != usbStreamTexWidth || h != usbStreamTexHeight || usbStreamTexConfig != null) {
+                        usbStreamTexWidth = w
+                        usbStreamTexHeight = h
+                        usbStreamTexConfig = null
+                        GLES20.glTexImage2D(
+                            GLES20.GL_TEXTURE_2D, 0, GLES20.GL_RGBA,
+                            w, h, 0,
+                            GLES20.GL_RGBA, GLES20.GL_UNSIGNED_BYTE, rgbaBuf
+                        )
+                    } else {
+                        GLES20.glTexSubImage2D(
+                            GLES20.GL_TEXTURE_2D, 0, 0, 0,
+                            w, h,
+                            GLES20.GL_RGBA, GLES20.GL_UNSIGNED_BYTE, rgbaBuf
+                        )
+                    }
                 }
+
                 captureWidth = w
                 captureHeight = h
                 hasReceivedAnyUsbFrame = true
                 hasReceivedAnyCameraFrame = true
                 useLiveCameraStream = true
                 lastCameraFrameNs = nowNs
-                blankSignal = isBlank
+                blankSignal = decoded.isBlankSignal
 
                 val interval = (nowNs - lastSourceFrameTimeNs).coerceIn(4_000_000L, 100_000_000L)
                 estimatedSourceIntervalNs = (estimatedSourceIntervalNs * 3 + interval) / 4

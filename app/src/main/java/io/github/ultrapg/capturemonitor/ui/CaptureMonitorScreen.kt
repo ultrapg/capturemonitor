@@ -265,14 +265,13 @@ fun CaptureMonitorScreen(
                             viewModel.onRendererTelemetry(srcFps, outFps, genFps, frameMs, isLive, gpuName)
                         }
                     )
+                    setRenderer(renderer)
                     renderer.updateRenderConfig(state.renderConfig)
                     renderer.bindSource(
                         device = state.selectedDevice,
                         mode = state.selectedMode,
                         hasCameraPermission = state.hasCameraPermission
                     )
-                    setRenderer(renderer)
-                    renderMode = GLSurfaceView.RENDERMODE_CONTINUOUSLY
                     VulkanHardwarePipeline.syncViewBackend(this, state.renderConfig)
                     rendererRef = renderer
                 }

@@ -101,8 +101,8 @@ class MonitorViewModel(application: Application) : AndroidViewModel(application)
                 val needsRescan = isAppForeground && (
                     dev == null ||
                         dev.isSimulated ||
-                        dev.camera2Id == null ||
-                        !dev.hasUsbPermission
+                        !dev.hasUsbPermission ||
+                        (dev.usbDeviceName == null && dev.camera2Id == null)
                     )
                 if (needsRescan) refreshDevices()
             }
