@@ -13,8 +13,12 @@ import android.opengl.GLSurfaceView
 import android.opengl.Matrix
 import android.os.Handler
 import android.os.HandlerThread
+import android.os.Looper
 import android.util.Log
 import android.util.Range
+import android.util.Size
+import android.hardware.camera2.CameraCharacteristics
+import java.util.concurrent.atomic.AtomicBoolean
 import android.view.Surface
 import io.github.ultrapg.capturemonitor.model.AspectRatioPreset
 import io.github.ultrapg.capturemonitor.model.FrameGenMode
@@ -668,6 +672,38 @@ class HardwareVideoRenderer(
     private var lastFrameTimestampNs = System.nanoTime()
     private var smoothedFrameTimeMs = 8.3f
 
+    // --- Capture lifecycle / signal watchdog state ---
+    private val mainHandler = Handler(Looper.getMainLooper())
+    private val startPending = AtomicBoolean(false)
+
+    @Volatile
+    private var streamGeneration = 0
+
+    @Volatile
+    private var cameraOpenRequested = false
+
+    @Volatile
+    private var capturePaused = false
+
+    @Volatile
+    private var hasCameraPermissionFlag = false
+
+    /** Actual negotiated stream size (may differ from the requested mode if the card lacks it). */
+    @Volatile
+    private var captureWidth = 1920
+
+    @Volatile
+    private var captureHeight = 1080
+
+    @Volatile
+    private var lastCameraFrameNs = 0L
+
+    // Blank-feed ("card connected but no HDMI source") detection
+    private var blankSignal = false
+    private var blankSinceNs = 0L
+    private var lastBlankSampleNs = 0L
+    private val blankPixel = ByteBuffer.allocateDirect(4).order(ByteOrder.nativeOrder())
+
     private var cameraThread: HandlerThread? = null
     private var cameraHandler: Handler? = null
     private var openedCamera: CameraDevice? = null
@@ -681,20 +717,42 @@ class HardwareVideoRenderer(
         val modeOrCamChanged = (activeCameraId != cameraId) ||
             (activeMode.width != mode.width) ||
             (activeMode.height != mode.height) ||
-            (activeMode.fps != mode.fps)
+            (activeMode.fps != mode.fps) ||
+            (hasCameraPermissionFlag != hasCameraPermission)
 
         activeCameraId = cameraId
         activeMode = mode
+        hasCameraPermissionFlag = hasCameraPermission
         estimatedSourceIntervalNs = (1_000_000_000L / mode.fps.coerceAtLeast(1)).coerceIn(4_000_000L, 100_000_000L)
 
         if (cameraId != null && hasCameraPermission) {
-            if (modeOrCamChanged || !useLiveCameraStream) {
-                startCamera2Stream(cameraId, mode)
+            if (!capturePaused && (modeOrCamChanged || !cameraOpenRequested)) {
+                requestStartStream()
             }
         } else {
-            useLiveCameraStream = false
-            hasReceivedAnyCameraFrame = false
-            stopCamera2Stream()
+            mainHandler.post { stopCamera2Stream() }
+        }
+    }
+
+    /** Releases the camera (clears Android's green privacy dot) while the app is in the background. */
+    fun pauseCapture() {
+        capturePaused = true
+        mainHandler.post { stopCamera2Stream() }
+    }
+
+    /** Re-opens the capture card stream when the app returns to the foreground. */
+    fun resumeCapture() {
+        capturePaused = false
+        if (activeCameraId != null && hasCameraPermissionFlag) requestStartStream()
+    }
+
+    /** Coalesces start requests onto the main thread so open/close never overlap or race. */
+    private fun requestStartStream() {
+        if (startPending.compareAndSet(false, true)) {
+            mainHandler.post {
+                startPending.set(false)
+                startCamera2Stream()
+            }
         }
     }
 
@@ -720,17 +778,20 @@ class HardwareVideoRenderer(
         GLES20.glTexParameteri(GLES11Ext.GL_TEXTURE_EXTERNAL_OES, GLES20.GL_TEXTURE_WRAP_S, GLES20.GL_CLAMP_TO_EDGE)
         GLES20.glTexParameteri(GLES11Ext.GL_TEXTURE_EXTERNAL_OES, GLES20.GL_TEXTURE_WRAP_T, GLES20.GL_CLAMP_TO_EDGE)
 
-        ensureHistoryFbos(activeMode.width, activeMode.height)
+        ensureHistoryFbos(captureWidth, captureHeight)
 
+        // A fresh GL context needs a fresh SurfaceTexture; drop the old one (and the stream bound to it)
+        mainHandler.post { stopCamera2Stream() }
+        try { captureSurface?.release() } catch (_: Exception) {}
+        try { surfaceTexture?.release() } catch (_: Exception) {}
         surfaceTexture = SurfaceTexture(oesTextureId).apply {
             setDefaultBufferSize(activeMode.width, activeMode.height)
             setOnFrameAvailableListener(this@HardwareVideoRenderer)
         }
         captureSurface = Surface(surfaceTexture)
 
-        val camId = activeCameraId
-        if (camId != null) {
-            startCamera2Stream(camId, activeMode)
+        if (activeCameraId != null && hasCameraPermissionFlag && !capturePaused) {
+            requestStartStream()
         }
     }
 
@@ -787,7 +848,9 @@ class HardwareVideoRenderer(
         smoothedFrameTimeMs = smoothedFrameTimeMs * 0.85f + min(deltaMs, 100f) * 0.15f
 
         val cfg = renderConfig
-        val liveActive = useLiveCameraStream && hasReceivedAnyCameraFrame
+        // Signal watchdog: live only while frames keep arriving and the feed is not a blank "no HDMI" picture
+        val framesFresh = hasReceivedAnyCameraFrame && (nowNs - lastCameraFrameNs) < 1_500_000_000L
+        val liveActive = useLiveCameraStream && framesFresh && !blankSignal
 
         if (frameAvailable) {
             frameAvailable = false
@@ -803,12 +866,18 @@ class HardwareVideoRenderer(
             } catch (_: Exception) {
             }
 
-            ensureHistoryFbos(activeMode.width, activeMode.height)
+            ensureHistoryFbos(captureWidth, captureHeight)
             // Advance ping-pong history slot and capture new OES frame into currentHistorySlot
             currentHistorySlot = 1 - currentHistorySlot
             GLES20.glBindFramebuffer(GLES20.GL_FRAMEBUFFER, historyFboIds[currentHistorySlot])
             GLES20.glViewport(0, 0, historyBufferWidth, historyBufferHeight)
             drawOesToHistoryFbo()
+            if (cfg.autoDetectBlankSignal) {
+                sampleBlankSignal(nowNs)
+            } else {
+                blankSignal = false
+                blankSinceNs = 0L
+            }
         } else if (!liveActive && cfg.showTestPatternWhenNoSignal) {
             // In calibration test pattern mode, tick simulated source frames at activeMode.fps (or 60Hz when FG is active)
             val simSourceFps = if (cfg.frameGenMode != FrameGenMode.OFF) {
@@ -897,6 +966,7 @@ class HardwareVideoRenderer(
     }
 
     override fun onFrameAvailable(surfaceTexture: SurfaceTexture?) {
+        lastCameraFrameNs = System.nanoTime()
         frameAvailable = true
         glSurfaceView.requestRender()
     }
@@ -1029,8 +1099,8 @@ class HardwareVideoRenderer(
         val viewAspect = viewportWidth.toFloat() / viewportHeight.toFloat()
         val targetAspect = when (cfg.aspectRatioPreset) {
             AspectRatioPreset.STRETCH_FILL -> viewAspect
-            AspectRatioPreset.ZOOM_CROP -> activeMode.width.toFloat() / activeMode.height.toFloat()
-            AspectRatioPreset.NATIVE -> activeMode.width.toFloat() / activeMode.height.toFloat()
+            AspectRatioPreset.ZOOM_CROP -> captureWidth.toFloat() / captureHeight.toFloat()
+            AspectRatioPreset.NATIVE -> captureWidth.toFloat() / captureHeight.toFloat()
             else -> cfg.aspectRatioPreset.ratio ?: viewAspect
         }
 
@@ -1069,10 +1139,63 @@ class HardwareVideoRenderer(
         Matrix.scaleM(mvpMatrix, 0, scaleX, scaleY, 1f)
     }
 
+    /**
+     * Picks the stream size the card really supports: exact match, else the closest area with the
+     * same aspect ratio, else the closest area overall. Prevents configure failures (= endless No Signal)
+     * when a requested custom resolution is not natively offered by the capture card.
+     */
+    private fun chooseCaptureSize(chars: CameraCharacteristics, mode: VideoMode): Size {
+        val wanted = Size(mode.width, mode.height)
+        val sizes = try {
+            chars.get(CameraCharacteristics.SCALER_STREAM_CONFIGURATION_MAP)
+                ?.getOutputSizes(SurfaceTexture::class.java)
+        } catch (_: Exception) {
+            null
+        }
+        if (sizes == null || sizes.isEmpty()) return wanted
+        sizes.firstOrNull { it.width == wanted.width && it.height == wanted.height }?.let { return it }
+        val wantedArea = wanted.width.toLong() * wanted.height
+        val wantedAspect = wanted.width.toFloat() / wanted.height
+        val sameAspect = sizes.filter { kotlin.math.abs(it.width.toFloat() / it.height - wantedAspect) < 0.02f }
+        val pool = if (sameAspect.isNotEmpty()) sameAspect else sizes.toList()
+        return pool.minByOrNull { kotlin.math.abs(it.width.toLong() * it.height - wantedArea) } ?: wanted
+    }
+
+    private fun chooseFpsRange(chars: CameraCharacteristics, fps: Int): Range<Int>? {
+        val ranges = try {
+            chars.get(CameraCharacteristics.CONTROL_AE_AVAILABLE_TARGET_FPS_RANGES)
+        } catch (_: Exception) {
+            null
+        }
+        if (ranges == null || ranges.isEmpty()) return null
+        val bestUpper = ranges.minOf { kotlin.math.abs(it.upper - fps) }
+        return ranges.filter { kotlin.math.abs(it.upper - fps) == bestUpper }.maxByOrNull { it.lower }
+    }
+
+    private fun scheduleStreamRetry(generation: Int) {
+        mainHandler.postDelayed({
+            if (generation == streamGeneration && !capturePaused &&
+                activeCameraId != null && hasCameraPermissionFlag
+            ) {
+                requestStartStream()
+            }
+        }, 2000L)
+    }
+
+    /** Must run on the main thread (always reached through [requestStartStream]). */
     @SuppressLint("MissingPermission")
-    private fun startCamera2Stream(cameraId: String, mode: VideoMode) {
+    private fun startCamera2Stream() {
+        val cameraId = activeCameraId ?: return
         val surface = captureSurface ?: return
+        if (capturePaused || !hasCameraPermissionFlag) return
+        val mode = activeMode
+
         stopCamera2Stream()
+        val generation = ++streamGeneration
+        cameraOpenRequested = true
+        hasReceivedAnyCameraFrame = false
+        blankSignal = false
+        blankSinceNs = 0L
 
         val thread = HandlerThread("UvcCamera2Thread").also { it.start() }
         val handler = Handler(thread.looper)
@@ -1080,24 +1203,37 @@ class HardwareVideoRenderer(
         cameraHandler = handler
 
         try {
-            surfaceTexture?.setDefaultBufferSize(mode.width, mode.height)
             val camManager = context.getSystemService(Context.CAMERA_SERVICE) as CameraManager
+            val chars = camManager.getCameraCharacteristics(cameraId)
+            val size = chooseCaptureSize(chars, mode)
+            val fpsRange = chooseFpsRange(chars, mode.fps)
+            captureWidth = size.width
+            captureHeight = size.height
+            surfaceTexture?.setDefaultBufferSize(size.width, size.height)
+
             camManager.openCamera(cameraId, object : CameraDevice.StateCallback() {
                 override fun onOpened(camera: CameraDevice) {
+                    if (generation != streamGeneration) {
+                        camera.close()
+                        return
+                    }
                     openedCamera = camera
                     try {
                         val requestBuilder = camera.createCaptureRequest(CameraDevice.TEMPLATE_RECORD).apply {
                             addTarget(surface)
-                            set(
-                                CaptureRequest.CONTROL_AE_TARGET_FPS_RANGE,
-                                Range(mode.fps.coerceAtMost(60), mode.fps.coerceAtMost(60))
-                            )
+                            if (fpsRange != null) {
+                                set(CaptureRequest.CONTROL_AE_TARGET_FPS_RANGE, fpsRange)
+                            }
                         }
                         @Suppress("DEPRECATION")
                         camera.createCaptureSession(
                             listOf(surface),
                             object : CameraCaptureSession.StateCallback() {
                                 override fun onConfigured(session: CameraCaptureSession) {
+                                    if (generation != streamGeneration) {
+                                        session.close()
+                                        return
+                                    }
                                     captureSession = session
                                     try {
                                         session.setRepeatingRequest(requestBuilder.build(), null, handler)
@@ -1105,12 +1241,14 @@ class HardwareVideoRenderer(
                                     } catch (e: Exception) {
                                         Log.w(TAG, "Repeating request error: ${e.message}")
                                         useLiveCameraStream = false
+                                        scheduleStreamRetry(generation)
                                     }
                                 }
 
                                 override fun onConfigureFailed(session: CameraCaptureSession) {
-                                    Log.w(TAG, "Camera2 session configure failed for ${mode.resolutionLabel}")
+                                    Log.w(TAG, "Camera2 session configure failed for ${size.width}x${size.height}")
                                     useLiveCameraStream = false
+                                    scheduleStreamRetry(generation)
                                 }
                             },
                             handler
@@ -1118,6 +1256,7 @@ class HardwareVideoRenderer(
                     } catch (e: Exception) {
                         Log.w(TAG, "Session creation error: ${e.message}")
                         useLiveCameraStream = false
+                        scheduleStreamRetry(generation)
                     }
                 }
 
@@ -1125,21 +1264,84 @@ class HardwareVideoRenderer(
                     useLiveCameraStream = false
                     hasReceivedAnyCameraFrame = false
                     camera.close()
+                    if (generation == streamGeneration) {
+                        cameraOpenRequested = false
+                        scheduleStreamRetry(generation)
+                    }
                 }
 
                 override fun onError(camera: CameraDevice, error: Int) {
+                    Log.w(TAG, "Camera error $error")
                     useLiveCameraStream = false
                     hasReceivedAnyCameraFrame = false
                     camera.close()
+                    if (generation == streamGeneration) {
+                        cameraOpenRequested = false
+                        scheduleStreamRetry(generation)
+                    }
                 }
             }, handler)
         } catch (e: Exception) {
             Log.w(TAG, "Unable to open camera $cameraId: ${e.message}")
             useLiveCameraStream = false
+            scheduleStreamRetry(generation)
         }
     }
 
+    /**
+     * Reads a 4x4 grid of pixels from the frame just rendered into the bound history FBO.
+     * A perfectly uniform dark or solid-blue picture held for >1.5 s is what capture cards output
+     * when no HDMI source is attached, so it is reported as No Signal. Runs at ~2.5 Hz (negligible cost).
+     */
+    private fun sampleBlankSignal(nowNs: Long) {
+        if (nowNs - lastBlankSampleNs < 400_000_000L) return
+        lastBlankSampleNs = nowNs
+        val w = historyBufferWidth
+        val h = historyBufferHeight
+        if (w <= 0 || h <= 0) return
+
+        var minR = 255; var minG = 255; var minB = 255
+        var maxR = 0; var maxG = 0; var maxB = 0
+        var sumR = 0; var sumG = 0; var sumB = 0
+        for (gy in 0 until 4) {
+            for (gx in 0 until 4) {
+                val x = ((gx + 0.5f) / 4f * w).toInt().coerceIn(0, w - 1)
+                val y = ((gy + 0.5f) / 4f * h).toInt().coerceIn(0, h - 1)
+                blankPixel.clear()
+                GLES20.glReadPixels(x, y, 1, 1, GLES20.GL_RGBA, GLES20.GL_UNSIGNED_BYTE, blankPixel)
+                val r = blankPixel.get(0).toInt() and 0xFF
+                val g = blankPixel.get(1).toInt() and 0xFF
+                val b = blankPixel.get(2).toInt() and 0xFF
+                minR = min(minR, r); maxR = max(maxR, r); sumR += r
+                minG = min(minG, g); maxG = max(maxG, g); sumG += g
+                minB = min(minB, b); maxB = max(maxB, b); sumB += b
+            }
+        }
+        val uniform = (maxR - minR) <= 8 && (maxG - minG) <= 8 && (maxB - minB) <= 8
+        val avgR = sumR / 16
+        val avgG = sumG / 16
+        val avgB = sumB / 16
+        val luma = (avgR * 0.2126f + avgG * 0.7152f + avgB * 0.0722f)
+        val dark = luma <= 26f
+        val blue = avgB - max(avgR, avgG) >= 40
+        val blankNow = uniform && (dark || blue)
+
+        if (blankNow) {
+            if (blankSinceNs == 0L) blankSinceNs = nowNs
+            if (nowNs - blankSinceNs >= 1_500_000_000L) blankSignal = true
+        } else {
+            blankSinceNs = 0L
+            blankSignal = false
+        }
+    }
+
+    /** Closes the camera session + device. Must run on the main thread. */
     fun stopCamera2Stream() {
+        streamGeneration++
+        cameraOpenRequested = false
+        useLiveCameraStream = false
+        hasReceivedAnyCameraFrame = false
+
         try {
             captureSession?.close()
         } catch (_: Exception) {
@@ -1161,6 +1363,8 @@ class HardwareVideoRenderer(
     }
 
     fun release() {
+        capturePaused = true
+        mainHandler.removeCallbacksAndMessages(null)
         stopCamera2Stream()
         try {
             captureSurface?.release()

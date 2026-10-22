@@ -107,6 +107,9 @@ class UsbCaptureDiscovery(
     private val cameraManager = context.getSystemService(Context.CAMERA_SERVICE) as CameraManager
     private var receiverRegistered = false
 
+    /** USB devices we already showed a permission dialog for (prevents dialog spam while re-scanning). */
+    private val permissionRequestedFor = mutableSetOf<String>()
+
     private val usbReceiver = object : BroadcastReceiver() {
         override fun onReceive(ctx: Context, intent: Intent) {
             when (intent.action) {
@@ -217,13 +220,15 @@ class UsbCaptureDiscovery(
 
         // 2. Inspect physically connected USB devices via UsbManager
         val usbDevices = usbManager.deviceList.values.toList()
+        // Forget unplugged devices so re-plugging prompts again
+        permissionRequestedFor.retainAll(usbDevices.map { it.deviceName }.toSet())
         for (usbDevice in usbDevices) {
             if (isVideoCaptureUsbDevice(usbDevice)) {
                 val hasPerm = usbManager.hasPermission(usbDevice)
                 if (!hasPerm) {
-                    // Proactively request USB permission when a capture card is plugged in
+                    // Proactively request USB permission once per plug-in
                     try {
-                        requestUsbPermission(usbDevice)
+                        if (permissionRequestedFor.add(usbDevice.deviceName)) requestUsbPermission(usbDevice)
                     } catch (_: Exception) {
                     }
                 }

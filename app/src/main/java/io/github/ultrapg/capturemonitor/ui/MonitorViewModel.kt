@@ -81,6 +81,45 @@ class MonitorViewModel(application: Application) : AndroidViewModel(application)
         usbDiscovery.register()
         audioEngine.register()
         refreshDevices()
+        startDevicePolling()
+    }
+
+    private var isAppForeground = true
+    private var refreshJob: kotlinx.coroutines.Job? = null
+
+    /**
+     * Safety net for missed USB / Camera2 hot-plug broadcasts: while no usable capture card is
+     * bound (none attached, camera node not yet enumerated, or USB permission pending) we
+     * re-scan every 2 seconds so a freshly connected card is picked up reliably.
+     */
+    private fun startDevicePolling() {
+        viewModelScope.launch {
+            while (true) {
+                kotlinx.coroutines.delay(2000)
+                val s = _uiState.value
+                val dev = s.selectedDevice
+                val needsRescan = isAppForeground && (
+                    dev == null ||
+                        dev.isSimulated ||
+                        dev.camera2Id == null ||
+                        !dev.hasUsbPermission
+                    )
+                if (needsRescan) refreshDevices()
+            }
+        }
+    }
+
+    /**
+     * Called when the app moves to/from the foreground. The microphone is released in the
+     * background (clearing the privacy indicator) and everything is re-synced on return.
+     */
+    fun onAppForeground(foreground: Boolean) {
+        isAppForeground = foreground
+        if (foreground) {
+            refreshDevices()
+        } else {
+            audioEngine.stop()
+        }
     }
 
     /**
@@ -103,7 +142,10 @@ class MonitorViewModel(application: Application) : AndroidViewModel(application)
     }
 
     fun refreshDevices() {
-        viewModelScope.launch {
+        // Debounce bursts of USB / Camera2 callbacks into a single discovery pass
+        refreshJob?.cancel()
+        refreshJob = viewModelScope.launch {
+            kotlinx.coroutines.delay(150)
             val found = usbDiscovery.discoverCaptureDevices()
             val previouslyConnectedId = _uiState.value.selectedDevice?.id
 
@@ -130,7 +172,7 @@ class MonitorViewModel(application: Application) : AndroidViewModel(application)
             // Immediately update the audio engine with whether a physical capture card is attached
             val isPhysicalConnected = _uiState.value.isCaptureCardConnected
             audioEngine.isCaptureCardPhysicallyConnected = isPhysicalConnected
-            audioEngine.syncAudioState()
+            if (isAppForeground) audioEngine.syncAudioState()
         }
     }
 
@@ -349,6 +391,8 @@ class MonitorViewModel(application: Application) : AndroidViewModel(application)
         isReceivingLiveFrames: Boolean,
         gpuHardwareName: String
     ) {
+        // Silence the audio path whenever no real HDMI picture is arriving (prevents idle ADC hiss)
+        audioEngine.isSignalPresent = isReceivingLiveFrames
         _uiState.update { state ->
             val bitrate = if (state.isCaptureCardConnected || state.renderConfig.showTestPatternWhenNoSignal) {
                 state.selectedMode.requiredMbps.toFloat()

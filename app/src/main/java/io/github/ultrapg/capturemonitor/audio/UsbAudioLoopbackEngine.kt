@@ -60,6 +60,14 @@ class UsbAudioLoopbackEngine(
     @Volatile
     var isMuted: Boolean = false
 
+    /** False while the capture card delivers no real HDMI picture; the output is silenced to avoid idle hiss. */
+    @Volatile
+    var isSignalPresent: Boolean = true
+
+    /** Incremented on every start/stop so a stale worker thread can never keep running next to a new one. */
+    @Volatile
+    private var runGeneration = 0
+
     /**
      * Digital noise gate threshold in dBFS (-90 dB to -20 dB). Default -58 dB eliminates idle USB ADC hiss.
      */
@@ -131,6 +139,7 @@ class UsbAudioLoopbackEngine(
     @SuppressLint("MissingPermission")
     private fun startWithDevice(usbInputDevice: AudioDeviceInfo, deviceLabel: String) {
         if (isRunning.getAndSet(true)) return
+        val myGeneration = ++runGeneration
 
         workerThread = Thread({
             Process.setThreadPriority(Process.THREAD_PRIORITY_URGENT_AUDIO)
@@ -218,7 +227,7 @@ class UsbAudioLoopbackEngine(
                 val pcmBuffer = ShortArray(bufferSize / 2)
                 var envelopeGain = 0f
 
-                while (isRunning.get() && isCaptureCardPhysicallyConnected && userEnabled) {
+                while (runGeneration == myGeneration && isRunning.get() && isCaptureCardPhysicallyConnected && userEnabled) {
                     // Also check if the USB audio device was unplugged mid-read
                     if (findUsbCaptureAudioInputDevice() == null) break
 
@@ -234,7 +243,7 @@ class UsbAudioLoopbackEngine(
 
                         // Convert dB threshold (-90..0) to linear amplitude
                         val gateLinear = Math.pow(10.0, (noiseGateDb.toDouble() / 20.0)).toFloat()
-                        val targetGate = if (rawRmsNorm >= gateLinear && !isMuted) 1.0f else 0.0f
+                        val targetGate = if (rawRmsNorm >= gateLinear && !isMuted && isSignalPresent) 1.0f else 0.0f
                         // Smooth attack/release to avoid clicks
                         envelopeGain = envelopeGain * 0.75f + targetGate * 0.25f
 
@@ -273,13 +282,16 @@ class UsbAudioLoopbackEngine(
                     player?.release()
                 } catch (_: Exception) {
                 }
-                isRunning.set(false)
-                onAudioStatusUpdate(0f, null)
+                if (runGeneration == myGeneration) {
+                    isRunning.set(false)
+                    onAudioStatusUpdate(0f, null)
+                }
             }
         }, "UsbAudioLoopbackThread").also { it.start() }
     }
 
     fun stop() {
+        runGeneration++
         isRunning.set(false)
         try {
             workerThread?.join(200)

@@ -6,6 +6,14 @@ Built as a clean, zero-bloat, open-source alternative to apps like **Noir**, wit
 
 ---
 
+## What's new in v0.6.0
+
+- **Reliable "No Signal"**: a connected card with no HDMI source now shows a clear No Signal screen (frame watchdog + blank/solid-blue feed detection, toggleable), and video returns automatically when a source is connected.
+- **Reliable hot-plug auto-detect**: debounced USB + Camera2 callbacks plus a 2 s safety-net rescan; USB permission prompt shown once per plug-in.
+- **Robust capture**: negotiates the closest stream size / FPS range the card really supports, retries on errors, never races open/close.
+- **Privacy indicator**: the camera and microphone are fully released whenever the app is in the background or no card is attached. While a card is actively streaming, Android itself shows the green camera dot; apps cannot hide it. (Optional, user-side: `adb shell device_config put privacy camera_mic_icons_enabled false`.)
+- **Audio**: output is silenced when there is no picture, and the loopback thread can no longer be duplicated after pause/resume.
+
 ## Key Features (v0.5.0)
 
 - **Open Frame Generation & Motion Interpolation Suite (Ping-Pong Temporal FBO Pipeline)**:

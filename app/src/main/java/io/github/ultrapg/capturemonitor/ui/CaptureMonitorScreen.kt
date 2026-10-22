@@ -159,6 +159,27 @@ fun CaptureMonitorScreen(
         }
     }
 
+    // Release the camera + microphone whenever the app is not in the foreground
+    // (this also clears Android's green privacy indicator while backgrounded) and resume on return.
+    val lifecycleOwner = androidx.compose.ui.platform.LocalLifecycleOwner.current
+    DisposableEffect(lifecycleOwner, rendererRef) {
+        val observer = androidx.lifecycle.LifecycleEventObserver { _, event ->
+            when (event) {
+                androidx.lifecycle.Lifecycle.Event.ON_PAUSE -> {
+                    rendererRef?.pauseCapture()
+                    viewModel.onAppForeground(false)
+                }
+                androidx.lifecycle.Lifecycle.Event.ON_RESUME -> {
+                    rendererRef?.resumeCapture()
+                    viewModel.onAppForeground(true)
+                }
+                else -> Unit
+            }
+        }
+        lifecycleOwner.lifecycle.addObserver(observer)
+        onDispose { lifecycleOwner.lifecycle.removeObserver(observer) }
+    }
+
     Box(
         modifier = Modifier
             .fillMaxSize()
@@ -272,10 +293,21 @@ fun CaptureMonitorScreen(
         )
 
         // 2. Minimalistic Material Design 3 "No Signal" Empty State
-        // Shown ONLY when no physical capture card is connected and calibration test pattern is off.
-        val showMinimalNoSignal = !state.isCaptureCardConnected &&
-            !state.isReceivingLiveFrames &&
+        // Shown whenever no live video is arriving (no card, card without HDMI source, or still connecting)
+        // and the calibration test pattern is off.
+        val showMinimalNoSignal = !state.isReceivingLiveFrames &&
             !state.renderConfig.showTestPatternWhenNoSignal
+
+        val noSignalMessage = when {
+            !state.isCaptureCardConnected ->
+                "Connect a USB-C or USB HDMI capture card.\nSwipe from edge or press Back for settings."
+            !state.hasCameraPermission ->
+                "Capture card detected.\nGrant camera permission to start video."
+            state.selectedDevice?.hasUsbPermission == false ->
+                "Capture card detected.\nAllow USB access when prompted."
+            else ->
+                "Capture card connected, but no HDMI signal.\nConnect and power on an HDMI source — it starts automatically."
+        }
 
         AnimatedVisibility(
             visible = showMinimalNoSignal,
@@ -286,6 +318,7 @@ fun CaptureMonitorScreen(
             MinimalNoSignalM3State(
                 hostDisplayLabel = state.hostDisplay.label,
                 selectedModeLabel = "${state.selectedMode.resolutionLabel} @ ${state.selectedMode.fps}Hz",
+                message = noSignalMessage,
                 onOpenMenu = { viewModel.setPanelOpen(true) },
                 onRescanUsb = { viewModel.refreshDevices() }
             )
@@ -392,6 +425,7 @@ fun CaptureMonitorScreen(
 private fun MinimalNoSignalM3State(
     hostDisplayLabel: String,
     selectedModeLabel: String,
+    message: String,
     onOpenMenu: () -> Unit,
     onRescanUsb: () -> Unit
 ) {
@@ -434,7 +468,7 @@ private fun MinimalNoSignalM3State(
             Spacer(Modifier.height(6.dp))
 
             Text(
-                text = "Connect a USB-C or USB HDMI capture card.\nSwipe from edge or press Back for settings.",
+                text = message,
                 style = MaterialTheme.typography.bodyMedium,
                 color = Color(0xFF94A3B8),
                 textAlign = TextAlign.Center
@@ -1798,6 +1832,23 @@ private fun AudioAndHudTab(
                 checked = state.renderConfig.showTestPatternWhenNoSignal,
                 onCheckedChange = { show ->
                     viewModel.updateRenderConfig { it.copy(showTestPatternWhenNoSignal = show) }
+                }
+            )
+        }
+
+        Spacer(Modifier.height(8.dp))
+        Row(
+            verticalAlignment = Alignment.CenterVertically,
+            modifier = Modifier.fillMaxWidth()
+        ) {
+            Column(modifier = Modifier.weight(1f)) {
+                Text("Detect Blank HDMI Feed as No Signal", color = Color.White, fontSize = 12.sp)
+                Text("Cards that stream a black / solid-blue frame with no HDMI source show No Signal", color = Color(0xFF94A3B8), fontSize = 11.sp)
+            }
+            Switch(
+                checked = state.renderConfig.autoDetectBlankSignal,
+                onCheckedChange = { on ->
+                    viewModel.updateRenderConfig { it.copy(autoDetectBlankSignal = on) }
                 }
             )
         }
