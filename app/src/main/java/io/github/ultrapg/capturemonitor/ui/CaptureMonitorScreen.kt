@@ -147,7 +147,7 @@ fun CaptureMonitorScreen(
 
     LaunchedEffect(state.selectedDevice, state.selectedMode, state.hasCameraPermission) {
         rendererRef?.bindSource(
-            cameraId = state.selectedDevice?.camera2Id,
+            device = state.selectedDevice,
             mode = state.selectedMode,
             hasCameraPermission = state.hasCameraPermission
         )
@@ -267,7 +267,7 @@ fun CaptureMonitorScreen(
                     )
                     renderer.updateRenderConfig(state.renderConfig)
                     renderer.bindSource(
-                        cameraId = state.selectedDevice?.camera2Id,
+                        device = state.selectedDevice,
                         mode = state.selectedMode,
                         hasCameraPermission = state.hasCameraPermission
                     )
@@ -301,10 +301,10 @@ fun CaptureMonitorScreen(
         val noSignalMessage = when {
             !state.isCaptureCardConnected ->
                 "Connect a USB-C or USB HDMI capture card.\nSwipe from edge or press Back for settings."
-            !state.hasCameraPermission ->
-                "Capture card detected.\nGrant camera permission to start video."
             state.selectedDevice?.hasUsbPermission == false ->
-                "Capture card detected.\nAllow USB access when prompted."
+                "Capture card detected (${state.selectedDevice?.name}).\nAllow USB access when prompted, or tap Rescan."
+            !state.hasCameraPermission && state.selectedDevice?.usbDeviceName == null ->
+                "Capture card detected.\nGrant camera permission to start video."
             else ->
                 "Capture card connected, but no HDMI signal.\nConnect and power on an HDMI source — it starts automatically."
         }
@@ -320,7 +320,12 @@ fun CaptureMonitorScreen(
                 selectedModeLabel = "${state.selectedMode.resolutionLabel} @ ${state.selectedMode.fps}Hz",
                 message = noSignalMessage,
                 onOpenMenu = { viewModel.setPanelOpen(true) },
-                onRescanUsb = { viewModel.refreshDevices() }
+                onRescanUsb = {
+                    if (state.selectedDevice?.hasUsbPermission == false) {
+                        viewModel.requestUsbPermissionForCurrentDevice()
+                    }
+                    viewModel.refreshDevices()
+                }
             )
         }
 

@@ -110,9 +110,6 @@ class UsbCaptureDiscovery(
     /** USB devices we already showed a permission dialog for (prevents dialog spam while re-scanning). */
     private val permissionRequestedFor = mutableSetOf<String>()
 
-    /** Camera IDs observed when no USB video device was plugged in (internal phone cameras). */
-    private val baselineInternalCameraIds = mutableSetOf<String>()
-
     private val usbReceiver = object : BroadcastReceiver() {
         override fun onReceive(ctx: Context, intent: Intent) {
             when (intent.action) {
@@ -211,36 +208,28 @@ class UsbCaptureDiscovery(
         // Forget unplugged devices so re-plugging prompts again
         permissionRequestedFor.retainAll(usbDevices.map { it.deviceName }.toSet())
 
-        // 2. Inspect external UVC Camera2 devices exposed by the Android kernel
+        // 2. Inspect external UVC Camera2 devices exposed by the Android kernel.
+        // Strictly exclude LENS_FACING_BACK and LENS_FACING_FRONT so built-in phone cameras are NEVER opened!
         val externalCameraIds = mutableListOf<String>()
-        val allCameraIds = mutableListOf<String>()
-        val physicalSubCameraIds = mutableSetOf<String>()
         try {
             for (camId in cameraManager.cameraIdList) {
-                allCameraIds.add(camId)
                 val chars = cameraManager.getCameraCharacteristics(camId)
                 val facing = chars.get(CameraCharacteristics.LENS_FACING)
+                if (facing == CameraCharacteristics.LENS_FACING_BACK ||
+                    facing == CameraCharacteristics.LENS_FACING_FRONT
+                ) {
+                    continue
+                }
                 val hwLevel = chars.get(CameraCharacteristics.INFO_SUPPORTED_HARDWARE_LEVEL)
                 val isExternalHwLevel = Build.VERSION.SDK_INT >= Build.VERSION_CODES.P &&
                     hwLevel == CameraCharacteristics.INFO_SUPPORTED_HARDWARE_LEVEL_EXTERNAL
 
-                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.P) {
-                    try {
-                        physicalSubCameraIds.addAll(chars.physicalCameraIds)
-                    } catch (_: Exception) {
-                    }
-                }
-
-                if (facing == CameraCharacteristics.LENS_FACING_EXTERNAL || isExternalHwLevel || facing == null) {
+                if (facing == CameraCharacteristics.LENS_FACING_EXTERNAL || isExternalHwLevel) {
                     externalCameraIds.add(camId)
                 }
             }
         } catch (e: Exception) {
             Log.w(TAG, "Unable to query Camera2 characteristics: ${e.message}")
-        }
-
-        if (videoUsbDevices.isEmpty() && externalCameraIds.isEmpty()) {
-            baselineInternalCameraIds.addAll(allCameraIds)
         }
 
         for (usbDevice in videoUsbDevices) {
@@ -255,16 +244,8 @@ class UsbCaptureDiscovery(
             val vendor = CaptureCardVendor.fromVendorId(usbDevice.vendorId)
             val (usbStd, bcdVerStr, parsedModes) = inspectUsbDeviceDescriptors(usbDevice)
 
-            // Match with a genuine external camera ID, or a newly hotplugged camera ID not part of internal multi-cam
-            val nonInternalCandidates = allCameraIds.filter { id ->
-                id != "0" && id != "1" && !physicalSubCameraIds.contains(id) && !baselineInternalCameraIds.contains(id)
-            }
-            val fallbackCandidates = allCameraIds.filter { id ->
-                id != "0" && id != "1" && !physicalSubCameraIds.contains(id)
-            }
+            // Match ONLY with a genuine LENS_FACING_EXTERNAL Camera2 ID (never match built-in phone cameras)
             val matchedCameraId = externalCameraIds.firstOrNull()
-                ?: nonInternalCandidates.lastOrNull()
-                ?: fallbackCandidates.lastOrNull()
 
             val productName = buildDeviceTitle(usbDevice, vendor)
             val combinedModes = mergeModesWithAllQualities(parsedModes, queryCameraModes(matchedCameraId))

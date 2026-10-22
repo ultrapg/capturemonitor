@@ -20,11 +20,13 @@ import android.util.Range
 import android.util.Size
 import android.view.Surface
 import io.github.ultrapg.capturemonitor.model.AspectRatioPreset
+import io.github.ultrapg.capturemonitor.model.CaptureDeviceInfo
 import io.github.ultrapg.capturemonitor.model.FrameGenMode
 import io.github.ultrapg.capturemonitor.model.FrameGenMultiplier
 import io.github.ultrapg.capturemonitor.model.RenderConfig
 import io.github.ultrapg.capturemonitor.model.TextureFilteringMode
 import io.github.ultrapg.capturemonitor.model.VideoMode
+import io.github.ultrapg.capturemonitor.usb.UvcUsbStreamEngine
 import java.nio.ByteBuffer
 import java.nio.ByteOrder
 import java.nio.FloatBuffer
@@ -95,6 +97,16 @@ class HardwareVideoRenderer(
             uniform samplerExternalOES sOesTexture;
             void main() {
                 gl_FragColor = texture2D(sOesTexture, vTexCoord);
+            }
+        """
+
+        // Simple 2D texture copy shader for copying direct USB UVC textures into the FrameGen FBO ring
+        private const val FRAGMENT_SHADER_TEX2D_TO_FBO = """
+            precision highp float;
+            varying vec2 vTexCoord;
+            uniform sampler2D sTex2d;
+            void main() {
+                gl_FragColor = texture2D(sTex2d, vTexCoord);
             }
         """
 
@@ -617,6 +629,11 @@ class HardwareVideoRenderer(
         }
 
     private val identityMatrix = FloatArray(16).also { Matrix.setIdentityM(it, 0) }
+    private val usbFlipTexMatrix = FloatArray(16).apply {
+        Matrix.setIdentityM(this, 0)
+        Matrix.translateM(this, 0, 0f, 1f, 0f)
+        Matrix.scaleM(this, 0, 1f, -1f, 1f)
+    }
     private val mvpMatrix = FloatArray(16)
     private val texMatrix = FloatArray(16)
 
@@ -624,10 +641,34 @@ class HardwareVideoRenderer(
     private var oesUpscaleProgram = 0
     private var tex2dUpscaleProgram = 0
     private var oesToFboProgram = 0
+    private var tex2dToFboProgram = 0
     private var patternToFboProgram = 0
     private var frameGenProgram = 0
 
     private var oesTextureId = 0
+    private var usbStreamTexId = 0
+    private var usbStreamTexWidth = 0
+    private var usbStreamTexHeight = 0
+
+    private val usbFrameLock = Any()
+
+    @Volatile
+    private var pendingUsbRgbaBuffer: ByteBuffer? = null
+
+    @Volatile
+    private var pendingUsbWidth = 1920
+
+    @Volatile
+    private var pendingUsbHeight = 1080
+
+    @Volatile
+    private var pendingUsbBlankSignal = false
+
+    @Volatile
+    private var usbFrameAvailable = false
+
+    @Volatile
+    private var hasReceivedAnyUsbFrame = false
 
     // Ping-Pong History FBOs (slot 0 and slot 1) + FrameGen intermediate output FBO (slot 2)
     private val historyFboIds = IntArray(3)
@@ -646,6 +687,9 @@ class HardwareVideoRenderer(
 
     @Volatile
     private var renderConfig = RenderConfig()
+
+    @Volatile
+    private var activeDevice: CaptureDeviceInfo? = null
 
     @Volatile
     private var activeMode = VideoMode(1920, 1080, 30)
@@ -681,6 +725,18 @@ class HardwareVideoRenderer(
     // Synchronized camera session lifecycle state
     private val cameraLock = Any()
     private val mainHandler = Handler(Looper.getMainLooper())
+
+    private val uvcUsbStreamEngine = UvcUsbStreamEngine(context) { rgbaBuffer, width, height, isBlank ->
+        synchronized(usbFrameLock) {
+            pendingUsbRgbaBuffer = rgbaBuffer
+            pendingUsbWidth = width
+            pendingUsbHeight = height
+            pendingUsbBlankSignal = isBlank
+            usbFrameAvailable = true
+        }
+        lastCameraFrameNs = System.nanoTime()
+        glSurfaceView.requestRender()
+    }
 
     @Volatile
     private var streamGeneration = 0
@@ -721,41 +777,86 @@ class HardwareVideoRenderer(
         renderConfig = config
     }
 
-    fun bindSource(cameraId: String?, mode: VideoMode, hasCameraPermission: Boolean) {
-        val modeOrCamChanged = (activeCameraId != cameraId) ||
+    fun bindSource(device: CaptureDeviceInfo?, mode: VideoMode, hasCameraPermission: Boolean) {
+        val prevDevice = activeDevice
+        val cameraId = device?.camera2Id
+        val modeOrDeviceChanged = (prevDevice?.id != device?.id) ||
+            (prevDevice?.hasUsbPermission != device?.hasUsbPermission) ||
+            (activeCameraId != cameraId) ||
             (activeMode.width != mode.width) ||
             (activeMode.height != mode.height) ||
             (activeMode.fps != mode.fps) ||
+            (activeMode.format != mode.format) ||
             (hasCameraPermissionFlag != hasCameraPermission)
 
+        activeDevice = device
         activeCameraId = cameraId
         activeMode = mode
         hasCameraPermissionFlag = hasCameraPermission
         estimatedSourceIntervalNs = (1_000_000_000L / mode.fps.coerceAtLeast(1)).coerceIn(4_000_000L, 100_000_000L)
 
-        if (cameraId != null && hasCameraPermission) {
-            if (!capturePaused && (modeOrCamChanged || !cameraOpenRequested)) {
-                fallbackTier = 0
-                startCamera2StreamAsync()
-            }
-        } else {
+        if (device == null) {
+            mainHandler.removeCallbacksAndMessages(null)
+            uvcUsbStreamEngine.stop()
+            hasReceivedAnyUsbFrame = false
             stopCamera2StreamSync()
+            return
+        }
+
+        if (!capturePaused && (modeOrDeviceChanged || (!hasReceivedAnyUsbFrame && !cameraOpenRequested))) {
+            fallbackTier = 0
+            startCaptureStreamsForActiveDevice()
         }
     }
 
-    /** Releases the camera (clears Android's green privacy dot) while the app is in the background. */
+    /** Releases the capture card stream while the app is in the background. */
     fun pauseCapture() {
         capturePaused = true
         mainHandler.removeCallbacksAndMessages(null)
+        uvcUsbStreamEngine.stop()
+        hasReceivedAnyUsbFrame = false
         stopCamera2StreamSync()
     }
 
     /** Re-opens the capture card stream when the app returns to the foreground. */
     fun resumeCapture() {
         capturePaused = false
-        if (activeCameraId != null && hasCameraPermissionFlag && !cameraOpenRequested) {
+        if (activeDevice != null) {
             fallbackTier = 0
+            startCaptureStreamsForActiveDevice()
+        }
+    }
+
+    private fun startCaptureStreamsForActiveDevice() {
+        mainHandler.removeCallbacksAndMessages(null)
+        val device = activeDevice ?: return
+        val mode = activeMode
+        hasReceivedAnyUsbFrame = false
+
+        // 1. Primary path: Direct User-Space USB UVC Engine (supports all USB 2.0/3.0 Bulk & Isochronous capture cards
+        // without opening CameraManager or triggering Android's camera privacy dot)
+        if (device.usbDeviceName != null && device.hasUsbPermission) {
+            stopCamera2StreamSync()
+            uvcUsbStreamEngine.start(device, mode)
+
+            // If this Android device also exposes a genuine LENS_FACING_EXTERNAL Camera2 HAL device
+            // and direct USB streaming produces no frames within 2.8s, fall back to External Camera2 HAL
+            if (device.camera2Id != null && hasCameraPermissionFlag) {
+                val expectedDeviceId = device.id
+                mainHandler.postDelayed({
+                    if (!capturePaused && activeDevice?.id == expectedDeviceId && !hasReceivedAnyUsbFrame) {
+                        uvcUsbStreamEngine.stop()
+                        startCamera2StreamInternal()
+                    }
+                }, 2800L)
+            }
+        } else if (device.camera2Id != null && hasCameraPermissionFlag) {
+            // 2. Fallback path ONLY for genuine LENS_FACING_EXTERNAL Camera2 devices
+            uvcUsbStreamEngine.stop()
             startCamera2StreamAsync()
+        } else {
+            uvcUsbStreamEngine.stop()
+            stopCamera2StreamSync()
         }
     }
 
@@ -777,18 +878,28 @@ class HardwareVideoRenderer(
         oesUpscaleProgram = createGlProgram(VERTEX_SHADER, buildUpscalerFragmentShader(isExternalOes = true))
         tex2dUpscaleProgram = createGlProgram(VERTEX_SHADER, buildUpscalerFragmentShader(isExternalOes = false))
         oesToFboProgram = createGlProgram(VERTEX_SHADER, FRAGMENT_SHADER_OES_TO_FBO)
+        tex2dToFboProgram = createGlProgram(VERTEX_SHADER, FRAGMENT_SHADER_TEX2D_TO_FBO)
         patternToFboProgram = createGlProgram(VERTEX_SHADER, FRAGMENT_SHADER_PATTERN_TO_FBO)
         frameGenProgram = createGlProgram(VERTEX_SHADER, FRAGMENT_SHADER_FRAME_GEN_FBO)
 
-        val oesTex = IntArray(1)
-        GLES20.glGenTextures(1, oesTex, 0)
-        oesTextureId = oesTex[0]
+        val texIds = IntArray(2)
+        GLES20.glGenTextures(2, texIds, 0)
+        oesTextureId = texIds[0]
+        usbStreamTexId = texIds[1]
+        usbStreamTexWidth = 0
+        usbStreamTexHeight = 0
 
         GLES20.glBindTexture(GLES11Ext.GL_TEXTURE_EXTERNAL_OES, oesTextureId)
         GLES20.glTexParameterf(GLES11Ext.GL_TEXTURE_EXTERNAL_OES, GLES20.GL_TEXTURE_MIN_FILTER, GLES20.GL_LINEAR.toFloat())
         GLES20.glTexParameterf(GLES11Ext.GL_TEXTURE_EXTERNAL_OES, GLES20.GL_TEXTURE_MAG_FILTER, GLES20.GL_LINEAR.toFloat())
         GLES20.glTexParameteri(GLES11Ext.GL_TEXTURE_EXTERNAL_OES, GLES20.GL_TEXTURE_WRAP_S, GLES20.GL_CLAMP_TO_EDGE)
         GLES20.glTexParameteri(GLES11Ext.GL_TEXTURE_EXTERNAL_OES, GLES20.GL_TEXTURE_WRAP_T, GLES20.GL_CLAMP_TO_EDGE)
+
+        GLES20.glBindTexture(GLES20.GL_TEXTURE_2D, usbStreamTexId)
+        GLES20.glTexParameteri(GLES20.GL_TEXTURE_2D, GLES20.GL_TEXTURE_MIN_FILTER, GLES20.GL_LINEAR)
+        GLES20.glTexParameteri(GLES20.GL_TEXTURE_2D, GLES20.GL_TEXTURE_MAG_FILTER, GLES20.GL_LINEAR)
+        GLES20.glTexParameteri(GLES20.GL_TEXTURE_2D, GLES20.GL_TEXTURE_WRAP_S, GLES20.GL_CLAMP_TO_EDGE)
+        GLES20.glTexParameteri(GLES20.GL_TEXTURE_2D, GLES20.GL_TEXTURE_WRAP_T, GLES20.GL_CLAMP_TO_EDGE)
 
         // Reset FBO state for the new GL context
         historyFboIds.fill(0)
@@ -815,9 +926,9 @@ class HardwareVideoRenderer(
             captureSurface = Surface(st)
         }
 
-        if (activeCameraId != null && hasCameraPermissionFlag && !capturePaused) {
+        if (activeDevice != null && !capturePaused) {
             fallbackTier = 0
-            startCamera2StreamAsync()
+            startCaptureStreamsForActiveDevice()
         }
     }
 
@@ -876,6 +987,62 @@ class HardwareVideoRenderer(
         val cfg = renderConfig
         val fgEnabled = cfg.frameGenMode != FrameGenMode.OFF && frameGenProgram != 0 && tex2dUpscaleProgram != 0
 
+        if (usbFrameAvailable) {
+            var uploadBuf: ByteBuffer? = null
+            var w = 0
+            var h = 0
+            var isBlank = false
+            synchronized(usbFrameLock) {
+                if (usbFrameAvailable) {
+                    usbFrameAvailable = false
+                    uploadBuf = pendingUsbRgbaBuffer
+                    w = pendingUsbWidth
+                    h = pendingUsbHeight
+                    isBlank = pendingUsbBlankSignal
+                }
+            }
+            if (uploadBuf != null && w > 0 && h > 0) {
+                uploadBuf!!.position(0)
+                GLES20.glActiveTexture(GLES20.GL_TEXTURE0)
+                GLES20.glBindTexture(GLES20.GL_TEXTURE_2D, usbStreamTexId)
+                if (w != usbStreamTexWidth || h != usbStreamTexHeight) {
+                    usbStreamTexWidth = w
+                    usbStreamTexHeight = h
+                    GLES20.glTexImage2D(
+                        GLES20.GL_TEXTURE_2D, 0, GLES20.GL_RGBA,
+                        w, h, 0,
+                        GLES20.GL_RGBA, GLES20.GL_UNSIGNED_BYTE, uploadBuf
+                    )
+                } else {
+                    GLES20.glTexSubImage2D(
+                        GLES20.GL_TEXTURE_2D, 0, 0, 0,
+                        w, h,
+                        GLES20.GL_RGBA, GLES20.GL_UNSIGNED_BYTE, uploadBuf
+                    )
+                }
+                captureWidth = w
+                captureHeight = h
+                hasReceivedAnyUsbFrame = true
+                hasReceivedAnyCameraFrame = true
+                useLiveCameraStream = true
+                lastCameraFrameNs = nowNs
+                blankSignal = isBlank
+
+                val interval = (nowNs - lastSourceFrameTimeNs).coerceIn(4_000_000L, 100_000_000L)
+                estimatedSourceIntervalNs = (estimatedSourceIntervalNs * 3 + interval) / 4
+                lastSourceFrameTimeNs = nowNs
+                sourceFrameCount++
+
+                if (fgEnabled && tex2dToFboProgram != 0) {
+                    ensureHistoryFbos(captureWidth, captureHeight)
+                    currentHistorySlot = 1 - currentHistorySlot
+                    GLES20.glBindFramebuffer(GLES20.GL_FRAMEBUFFER, historyFboIds[currentHistorySlot])
+                    GLES20.glViewport(0, 0, historyBufferWidth, historyBufferHeight)
+                    drawTex2dToHistoryFbo(usbStreamTexId, usbFlipTexMatrix)
+                }
+            }
+        }
+
         if (frameAvailable) {
             frameAvailable = false
             val prevCount = receivedCameraFrames
@@ -912,7 +1079,8 @@ class HardwareVideoRenderer(
             }
         }
 
-        val framesFresh = hasReceivedAnyCameraFrame && (nowNs - lastCameraFrameNs) < 2_500_000_000L
+        val framesFresh = (hasReceivedAnyUsbFrame || hasReceivedAnyCameraFrame) &&
+            (nowNs - lastCameraFrameNs) < 2_500_000_000L
         val liveActive = useLiveCameraStream && framesFresh && (!cfg.autoDetectBlankSignal || !blankSignal)
 
         if (!liveActive && cfg.showTestPatternWhenNoSignal) {
@@ -938,7 +1106,7 @@ class HardwareVideoRenderer(
 
         computeMvpMatrix(cfg)
 
-        if (useLiveCameraStream && hasReceivedAnyCameraFrame && (!cfg.autoDetectBlankSignal || !blankSignal)) {
+        if (liveActive) {
             if (fgEnabled && historyBufferWidth > 0) {
                 val rawPhase = if (estimatedSourceIntervalNs > 0) {
                     ((nowNs - lastSourceFrameTimeNs).toFloat() / estimatedSourceIntervalNs.toFloat()).coerceIn(0.05f, 1.0f)
@@ -971,6 +1139,21 @@ class HardwareVideoRenderer(
                     texMat = identityMatrix,
                     srcWidth = historyBufferWidth,
                     srcHeight = historyBufferHeight,
+                    cfg = cfg
+                )
+            } else if (hasReceivedAnyUsbFrame && usbStreamTexWidth > 0 && tex2dUpscaleProgram != 0) {
+                // Direct Single-Pass USB 2D Texture -> Spatial Upscaler -> Screen path
+                presentedFrameCount++
+                GLES20.glBindFramebuffer(GLES20.GL_FRAMEBUFFER, 0)
+                GLES20.glViewport(0, 0, viewportWidth, viewportHeight)
+                GLES20.glClear(GLES20.GL_COLOR_BUFFER_BIT)
+                drawUpscaledQuad(
+                    program = tex2dUpscaleProgram,
+                    isExternalOes = false,
+                    textureId = usbStreamTexId,
+                    texMat = usbFlipTexMatrix,
+                    srcWidth = usbStreamTexWidth.coerceAtLeast(1),
+                    srcHeight = usbStreamTexHeight.coerceAtLeast(1),
                     cfg = cfg
                 )
             } else {
@@ -1097,6 +1280,33 @@ class HardwareVideoRenderer(
         GLES20.glActiveTexture(GLES20.GL_TEXTURE0)
         GLES20.glBindTexture(GLES11Ext.GL_TEXTURE_EXTERNAL_OES, oesTextureId)
         GLES20.glUniform1i(GLES20.glGetUniformLocation(oesToFboProgram, "sOesTexture"), 0)
+
+        GLES20.glDrawArrays(GLES20.GL_TRIANGLE_STRIP, 0, 4)
+    }
+
+    private fun drawTex2dToHistoryFbo(srcTexId: Int, texMat: FloatArray) {
+        GLES20.glUseProgram(tex2dToFboProgram)
+
+        val posLoc = GLES20.glGetAttribLocation(tex2dToFboProgram, "aPosition")
+        val texLoc = GLES20.glGetAttribLocation(tex2dToFboProgram, "aTextureCoord")
+        val mvpLoc = GLES20.glGetUniformLocation(tex2dToFboProgram, "uMVPMatrix")
+        val texMatLoc = GLES20.glGetUniformLocation(tex2dToFboProgram, "uTexMatrix")
+
+        quadVertices.position(0)
+        GLES20.glVertexAttribPointer(posLoc, 2, GLES20.GL_FLOAT, false, 16, quadVertices)
+        GLES20.glEnableVertexAttribArray(posLoc)
+
+        quadVertices.position(2)
+        GLES20.glVertexAttribPointer(texLoc, 2, GLES20.GL_FLOAT, false, 16, quadVertices)
+        GLES20.glEnableVertexAttribArray(texLoc)
+
+        GLES20.glUniformMatrix4fv(mvpLoc, 1, false, identityMatrix, 0)
+        GLES20.glUniformMatrix4fv(texMatLoc, 1, false, texMat, 0)
+        GLES20.glUniform1f(GLES20.glGetUniformLocation(tex2dToFboProgram, "uOverscanCrop"), 0f)
+
+        GLES20.glActiveTexture(GLES20.GL_TEXTURE0)
+        GLES20.glBindTexture(GLES20.GL_TEXTURE_2D, srcTexId)
+        GLES20.glUniform1i(GLES20.glGetUniformLocation(tex2dToFboProgram, "sTex2d"), 0)
 
         GLES20.glDrawArrays(GLES20.GL_TRIANGLE_STRIP, 0, 4)
     }
@@ -1386,6 +1596,15 @@ class HardwareVideoRenderer(
         try {
             val camManager = context.getSystemService(Context.CAMERA_SERVICE) as CameraManager
             val chars = camManager.getCameraCharacteristics(cameraId)
+            val facing = chars.get(CameraCharacteristics.LENS_FACING)
+            // Defense-in-depth: NEVER open the phone's built-in front or back camera!
+            if (facing == CameraCharacteristics.LENS_FACING_BACK ||
+                facing == CameraCharacteristics.LENS_FACING_FRONT
+            ) {
+                Log.w(TAG, "Refusing to open internal camera $cameraId (facing=$facing)")
+                cameraOpenRequested = false
+                return
+            }
             val size = chooseCaptureSize(chars, mode, tier)
             val fpsRange = if (tier == 0) chooseFlexibleFpsRange(chars, mode.fps) else null
             captureWidth = size.width
@@ -1586,6 +1805,8 @@ class HardwareVideoRenderer(
     fun release() {
         capturePaused = true
         mainHandler.removeCallbacksAndMessages(null)
+        uvcUsbStreamEngine.stop()
+        hasReceivedAnyUsbFrame = false
         stopCamera2StreamSync()
         synchronized(cameraLock) {
             try {

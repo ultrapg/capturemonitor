@@ -6,6 +6,17 @@ Built as a clean, zero-bloat, open-source alternative to apps like **Noir**, wit
 
 ---
 
+## What's new in v0.6.2
+
+- **Never Opens the Phone's Built-in Camera**:
+  - Removed the fallback Camera2 candidate heuristic that could select an auxiliary internal phone camera (`LENS_FACING_BACK` or `LENS_FACING_FRONT`, such as camera ID `"2"`) on devices where Android's `CameraManager` does not expose external USB UVC capture cards.
+  - Added strict `LENS_FACING_EXTERNAL` enforcement in both `UsbCaptureDiscovery` and `HardwareVideoRenderer` so the phone's front/rear cameras are **never** opened under any circumstances.
+- **Direct User-Space USB Video Class (UVC 1.0 / 1.1 / 1.5) Streaming Engine (`UvcUsbStreamEngine`)**:
+  - Streams live HDMI video directly from USB / USB-C Capture Cards (Magewell USB Capture HDMI, MacroSilicon MS2109 / MS2130, Elgato Cam Link, AVerMedia, EVGA XR1, Razer, and generic UVC capture cards) via `UsbManager.openDevice()` and Linux `usbfs` (`USBDEVFS_SUBMITURB` / `USBDEVFS_REAPURBNDELAY`).
+  - Supports both **USB Bulk** (`USB_ENDPOINT_XFER_BULK`) and **USB Isochronous** (`USB_ENDPOINT_XFER_ISOC`) streaming endpoints with automatic alternate-setting bandwidth selection and UVC `VS_PROBE_CONTROL` / `VS_COMMIT_CONTROL` negotiation.
+  - Real-time decoding of `MJPEG`, `YUY2`, `UYVY`, and `NV12` frames directly into the GPU spatial upscaler (`tex2dUpscaleProgram`) and temporal Frame Generation (`frameGenProgram`) pipeline.
+  - Because direct USB UVC streaming bypasses `CameraManager`, it also avoids triggering Android's camera privacy indicator dot on standard USB capture cards.
+
 ## What's new in v0.6.1
 
 - **Default 1080p @ 30 FPS (`1920×1080 @ 30Hz MJPEG`)**: Defaults out-of-the-box to 1080p @ 30 FPS for universal plug-and-play compatibility across all USB 2.0 and USB 3.0 HDMI capture cards while keeping all other default settings intact.
