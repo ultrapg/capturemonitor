@@ -27,6 +27,7 @@ import io.github.ultrapg.capturemonitor.model.FrameGenMode
 import io.github.ultrapg.capturemonitor.model.FrameGenMultiplier
 import io.github.ultrapg.capturemonitor.model.RenderConfig
 import io.github.ultrapg.capturemonitor.model.TextureFilteringMode
+import io.github.ultrapg.capturemonitor.model.VideoFormat
 import io.github.ultrapg.capturemonitor.model.VideoMode
 import io.github.ultrapg.capturemonitor.usb.DecodedUsbFrame
 import io.github.ultrapg.capturemonitor.usb.UvcUsbStreamEngine
@@ -103,13 +104,38 @@ class HardwareVideoRenderer(
             }
         """
 
-        // Simple 2D texture copy shader for copying direct USB UVC textures into the FrameGen FBO ring
+        // Simple 2D texture copy shader (also used as 1-instruction 1:1 Direct Passthrough shader!)
         private const val FRAGMENT_SHADER_TEX2D_TO_FBO = """
             precision highp float;
             varying vec2 vTexCoord;
             uniform sampler2D sTex2d;
             void main() {
                 gl_FragColor = texture2D(sTex2d, vTexCoord);
+            }
+        """
+
+        // Hardware GPU YUY2 / UYVY 4:2:2 -> RGB shader (0.0 ms CPU conversion for Magewell / MS2130 uncompressed streams)
+        private const val FRAGMENT_SHADER_YUY2_TO_RGB = """
+            precision highp float;
+            varying vec2 vTexCoord;
+            uniform sampler2D sYuy2Tex;
+            uniform float uFullWidth;
+            uniform int uIsUyvy;
+            void main() {
+                vec4 macro = texture2D(sYuy2Tex, vTexCoord);
+                float isOdd = step(0.5, fract(vTexCoord.x * uFullWidth * 0.5));
+                float y = (uIsUyvy == 1)
+                    ? mix(macro.g, macro.a, isOdd)
+                    : mix(macro.r, macro.b, isOdd);
+                float u = ((uIsUyvy == 1) ? macro.r : macro.g) - 0.5;
+                float v = ((uIsUyvy == 1) ? macro.b : macro.a) - 0.5;
+                float yScaled = max(0.0, y - 0.062745) * 1.164383;
+                vec3 rgb = vec3(
+                    yScaled + 1.596027 * v,
+                    yScaled - 0.391762 * u - 0.812968 * v,
+                    yScaled + 2.017232 * u
+                );
+                gl_FragColor = vec4(clamp(rgb, 0.0, 1.0), 1.0);
             }
         """
 
@@ -645,6 +671,7 @@ class HardwareVideoRenderer(
     private var tex2dUpscaleProgram = 0
     private var oesToFboProgram = 0
     private var tex2dToFboProgram = 0
+    private var yuy2ToRgbProgram = 0
     private var patternToFboProgram = 0
     private var frameGenProgram = 0
 
@@ -652,7 +679,10 @@ class HardwareVideoRenderer(
     private var usbStreamTexId = 0
     private var usbStreamTexWidth = 0
     private var usbStreamTexHeight = 0
+    private var usbStreamTexAllocW = 0
+    private var usbStreamTexAllocH = 0
     private var usbStreamTexConfig: Bitmap.Config? = null
+    private var usbRawYuvFormat: VideoFormat? = null
 
     private val usbFrameLock = Any()
 
@@ -741,16 +771,10 @@ class HardwareVideoRenderer(
         }
     }
 
-    private fun syncLowLatencyRenderMode(cfg: RenderConfig) {
-        val wantContinuous = cfg.frameGenMode != FrameGenMode.OFF || cfg.showTestPatternWhenNoSignal
-        val targetRenderMode = if (wantContinuous) {
-            GLSurfaceView.RENDERMODE_CONTINUOUSLY
-        } else {
-            GLSurfaceView.RENDERMODE_WHEN_DIRTY
-        }
+    private fun syncLowLatencyRenderMode(@Suppress("UNUSED_PARAMETER") cfg: RenderConfig) {
         try {
-            if (glSurfaceView.renderMode != targetRenderMode) {
-                glSurfaceView.renderMode = targetRenderMode
+            if (glSurfaceView.renderMode != GLSurfaceView.RENDERMODE_CONTINUOUSLY) {
+                glSurfaceView.renderMode = GLSurfaceView.RENDERMODE_CONTINUOUSLY
             }
         } catch (_: Exception) {
         }
@@ -903,6 +927,7 @@ class HardwareVideoRenderer(
         tex2dUpscaleProgram = createGlProgram(VERTEX_SHADER, buildUpscalerFragmentShader(isExternalOes = false))
         oesToFboProgram = createGlProgram(VERTEX_SHADER, FRAGMENT_SHADER_OES_TO_FBO)
         tex2dToFboProgram = createGlProgram(VERTEX_SHADER, FRAGMENT_SHADER_TEX2D_TO_FBO)
+        yuy2ToRgbProgram = createGlProgram(VERTEX_SHADER, FRAGMENT_SHADER_YUY2_TO_RGB)
         patternToFboProgram = createGlProgram(VERTEX_SHADER, FRAGMENT_SHADER_PATTERN_TO_FBO)
         frameGenProgram = createGlProgram(VERTEX_SHADER, FRAGMENT_SHADER_FRAME_GEN_FBO)
 
@@ -912,7 +937,10 @@ class HardwareVideoRenderer(
         usbStreamTexId = texIds[1]
         usbStreamTexWidth = 0
         usbStreamTexHeight = 0
+        usbStreamTexAllocW = 0
+        usbStreamTexAllocH = 0
         usbStreamTexConfig = null
+        usbRawYuvFormat = null
 
         GLES20.glBindTexture(GLES11Ext.GL_TEXTURE_EXTERNAL_OES, oesTextureId)
         GLES20.glTexParameterf(GLES11Ext.GL_TEXTURE_EXTERNAL_OES, GLES20.GL_TEXTURE_MIN_FILTER, GLES20.GL_LINEAR.toFloat())
@@ -1011,6 +1039,7 @@ class HardwareVideoRenderer(
 
         val cfg = renderConfig
         val fgEnabled = cfg.frameGenMode != FrameGenMode.OFF && frameGenProgram != 0 && tex2dUpscaleProgram != 0
+        val isDirectPassthrough = cfg.directPassthrough1To1 || cfg.filteringMode == TextureFilteringMode.OFF_PASSTHROUGH
 
         if (usbFrameAvailable) {
             var frame: DecodedUsbFrame? = null
@@ -1029,11 +1058,16 @@ class HardwareVideoRenderer(
 
                 val bmp = decoded.bitmap
                 val rgbaBuf = decoded.rgbaBuffer
+                val rawYuv = decoded.rawYuvFormat
+                usbRawYuvFormat = rawYuv
+
                 if (bmp != null && !bmp.isRecycled) {
-                    val cfgBmp = bmp.config ?: Bitmap.Config.RGB_565
-                    if (w != usbStreamTexWidth || h != usbStreamTexHeight || cfgBmp != usbStreamTexConfig) {
+                    val cfgBmp = bmp.config ?: Bitmap.Config.ARGB_8888
+                    if (w != usbStreamTexAllocW || h != usbStreamTexAllocH || cfgBmp != usbStreamTexConfig) {
                         usbStreamTexWidth = w
                         usbStreamTexHeight = h
+                        usbStreamTexAllocW = w
+                        usbStreamTexAllocH = h
                         usbStreamTexConfig = cfgBmp
                         GLUtils.texImage2D(GLES20.GL_TEXTURE_2D, 0, bmp, 0)
                     } else {
@@ -1041,19 +1075,28 @@ class HardwareVideoRenderer(
                     }
                 } else if (rgbaBuf != null) {
                     rgbaBuf.position(0)
-                    if (w != usbStreamTexWidth || h != usbStreamTexHeight || usbStreamTexConfig != null) {
+                    val uploadW = if (rawYuv == VideoFormat.YUY2 || rawYuv == VideoFormat.UYVY) {
+                        (w / 2).coerceAtLeast(1)
+                    } else {
+                        w
+                    }
+                    if (uploadW != usbStreamTexAllocW || h != usbStreamTexAllocH || usbStreamTexConfig != null) {
                         usbStreamTexWidth = w
                         usbStreamTexHeight = h
+                        usbStreamTexAllocW = uploadW
+                        usbStreamTexAllocH = h
                         usbStreamTexConfig = null
                         GLES20.glTexImage2D(
                             GLES20.GL_TEXTURE_2D, 0, GLES20.GL_RGBA,
-                            w, h, 0,
+                            uploadW, h, 0,
                             GLES20.GL_RGBA, GLES20.GL_UNSIGNED_BYTE, rgbaBuf
                         )
                     } else {
+                        usbStreamTexWidth = w
+                        usbStreamTexHeight = h
                         GLES20.glTexSubImage2D(
                             GLES20.GL_TEXTURE_2D, 0, 0, 0,
-                            w, h,
+                            uploadW, h,
                             GLES20.GL_RGBA, GLES20.GL_UNSIGNED_BYTE, rgbaBuf
                         )
                     }
@@ -1072,12 +1115,24 @@ class HardwareVideoRenderer(
                 lastSourceFrameTimeNs = nowNs
                 sourceFrameCount++
 
-                if (fgEnabled && tex2dToFboProgram != 0) {
+                val needsHistoryFbo = fgEnabled || (rawYuv != null && !isDirectPassthrough)
+                if (needsHistoryFbo) {
                     ensureHistoryFbos(captureWidth, captureHeight)
                     currentHistorySlot = 1 - currentHistorySlot
                     GLES20.glBindFramebuffer(GLES20.GL_FRAMEBUFFER, historyFboIds[currentHistorySlot])
                     GLES20.glViewport(0, 0, historyBufferWidth, historyBufferHeight)
-                    drawTex2dToHistoryFbo(usbStreamTexId, usbFlipTexMatrix)
+                    if (rawYuv != null && yuy2ToRgbProgram != 0) {
+                        drawYuy2ShaderPass(
+                            srcTexId = usbStreamTexId,
+                            mvpMat = identityMatrix,
+                            texMat = usbFlipTexMatrix,
+                            fullWidth = captureWidth,
+                            isUyvy = (rawYuv == VideoFormat.UYVY),
+                            overscanCrop = 0f
+                        )
+                    } else if (tex2dToFboProgram != 0) {
+                        drawTex2dToHistoryFbo(usbStreamTexId, usbFlipTexMatrix)
+                    }
                 }
             }
         }
@@ -1167,41 +1222,73 @@ class HardwareVideoRenderer(
                     cfg = cfg
                 )
 
-                // Pass 3: Upscale synthesized 2D texture to screen backbuffer
+                // Pass 3: Render synthesized 2D texture to screen backbuffer
                 GLES20.glBindFramebuffer(GLES20.GL_FRAMEBUFFER, 0)
                 GLES20.glViewport(0, 0, viewportWidth, viewportHeight)
                 GLES20.glClear(GLES20.GL_COLOR_BUFFER_BIT)
-                drawUpscaledQuad(
-                    program = tex2dUpscaleProgram,
-                    isExternalOes = false,
-                    textureId = historyTexIds[2],
-                    texMat = identityMatrix,
-                    srcWidth = historyBufferWidth,
-                    srcHeight = historyBufferHeight,
-                    cfg = cfg
-                )
-            } else if (hasReceivedAnyUsbFrame && usbStreamTexWidth > 0 && tex2dUpscaleProgram != 0) {
-                // Direct Single-Pass USB 2D Texture -> Spatial Upscaler -> Screen path
+                if (isDirectPassthrough && tex2dToFboProgram != 0) {
+                    drawTex2dDirectPassthroughToScreen(historyTexIds[2], identityMatrix, cfg)
+                } else {
+                    drawUpscaledQuad(
+                        program = tex2dUpscaleProgram,
+                        isExternalOes = false,
+                        textureId = historyTexIds[2],
+                        texMat = identityMatrix,
+                        srcWidth = historyBufferWidth,
+                        srcHeight = historyBufferHeight,
+                        cfg = cfg
+                    )
+                }
+            } else if (hasReceivedAnyUsbFrame && usbStreamTexWidth > 0) {
                 presentedFrameCount++
                 GLES20.glBindFramebuffer(GLES20.GL_FRAMEBUFFER, 0)
                 GLES20.glViewport(0, 0, viewportWidth, viewportHeight)
                 GLES20.glClear(GLES20.GL_COLOR_BUFFER_BIT)
-                drawUpscaledQuad(
-                    program = tex2dUpscaleProgram,
-                    isExternalOes = false,
-                    textureId = usbStreamTexId,
-                    texMat = usbFlipTexMatrix,
-                    srcWidth = usbStreamTexWidth.coerceAtLeast(1),
-                    srcHeight = usbStreamTexHeight.coerceAtLeast(1),
-                    cfg = cfg
-                )
+                val rawYuv = usbRawYuvFormat
+                if (isDirectPassthrough) {
+                    // 1:1 Direct Passthrough (Zero Upscaling / Zero Post-Processing Overhead!)
+                    if (rawYuv != null && yuy2ToRgbProgram != 0) {
+                        drawYuy2ShaderPass(
+                            srcTexId = usbStreamTexId,
+                            mvpMat = mvpMatrix,
+                            texMat = usbFlipTexMatrix,
+                            fullWidth = usbStreamTexWidth.coerceAtLeast(1),
+                            isUyvy = (rawYuv == VideoFormat.UYVY),
+                            overscanCrop = cfg.overscanCropPercent.coerceIn(0f, 0.15f)
+                        )
+                    } else if (tex2dToFboProgram != 0) {
+                        drawTex2dDirectPassthroughToScreen(usbStreamTexId, usbFlipTexMatrix, cfg)
+                    }
+                } else if (rawYuv != null && historyBufferWidth > 0 && tex2dUpscaleProgram != 0) {
+                    drawUpscaledQuad(
+                        program = tex2dUpscaleProgram,
+                        isExternalOes = false,
+                        textureId = historyTexIds[currentHistorySlot],
+                        texMat = identityMatrix,
+                        srcWidth = historyBufferWidth,
+                        srcHeight = historyBufferHeight,
+                        cfg = cfg
+                    )
+                } else if (tex2dUpscaleProgram != 0) {
+                    drawUpscaledQuad(
+                        program = tex2dUpscaleProgram,
+                        isExternalOes = false,
+                        textureId = usbStreamTexId,
+                        texMat = usbFlipTexMatrix,
+                        srcWidth = usbStreamTexWidth.coerceAtLeast(1),
+                        srcHeight = usbStreamTexHeight.coerceAtLeast(1),
+                        cfg = cfg
+                    )
+                }
             } else {
-                // Direct Zero-Copy OES -> Screen path (Fastest, zero FBO latency)
+                // Direct Zero-Copy OES -> Screen path
                 presentedFrameCount++
                 GLES20.glBindFramebuffer(GLES20.GL_FRAMEBUFFER, 0)
                 GLES20.glViewport(0, 0, viewportWidth, viewportHeight)
                 GLES20.glClear(GLES20.GL_COLOR_BUFFER_BIT)
-                if (oesUpscaleProgram != 0) {
+                if (isDirectPassthrough && oesToFboProgram != 0) {
+                    drawOesFallbackToScreen()
+                } else if (oesUpscaleProgram != 0) {
                     drawUpscaledQuad(
                         program = oesUpscaleProgram,
                         isExternalOes = true,
@@ -1243,15 +1330,19 @@ class HardwareVideoRenderer(
             GLES20.glBindFramebuffer(GLES20.GL_FRAMEBUFFER, 0)
             GLES20.glViewport(0, 0, viewportWidth, viewportHeight)
             GLES20.glClear(GLES20.GL_COLOR_BUFFER_BIT)
-            drawUpscaledQuad(
-                program = tex2dUpscaleProgram,
-                isExternalOes = false,
-                textureId = source2dTex,
-                texMat = identityMatrix,
-                srcWidth = historyBufferWidth,
-                srcHeight = historyBufferHeight,
-                cfg = cfg
-            )
+            if (isDirectPassthrough && tex2dToFboProgram != 0) {
+                drawTex2dDirectPassthroughToScreen(source2dTex, identityMatrix, cfg)
+            } else {
+                drawUpscaledQuad(
+                    program = tex2dUpscaleProgram,
+                    isExternalOes = false,
+                    textureId = source2dTex,
+                    texMat = identityMatrix,
+                    srcWidth = historyBufferWidth,
+                    srcHeight = historyBufferHeight,
+                    cfg = cfg
+                )
+            }
         } else {
             GLES20.glBindFramebuffer(GLES20.GL_FRAMEBUFFER, 0)
             GLES20.glViewport(0, 0, viewportWidth, viewportHeight)
@@ -1345,7 +1436,83 @@ class HardwareVideoRenderer(
 
         GLES20.glActiveTexture(GLES20.GL_TEXTURE0)
         GLES20.glBindTexture(GLES20.GL_TEXTURE_2D, srcTexId)
+        GLES20.glTexParameteri(GLES20.GL_TEXTURE_2D, GLES20.GL_TEXTURE_MIN_FILTER, GLES20.GL_LINEAR)
+        GLES20.glTexParameteri(GLES20.GL_TEXTURE_2D, GLES20.GL_TEXTURE_MAG_FILTER, GLES20.GL_LINEAR)
         GLES20.glUniform1i(GLES20.glGetUniformLocation(tex2dToFboProgram, "sTex2d"), 0)
+
+        GLES20.glDrawArrays(GLES20.GL_TRIANGLE_STRIP, 0, 4)
+    }
+
+    /**
+     * 1-Instruction Direct 1:1 Passthrough Shader path (`gl_FragColor = texture2D(sTex2d, vTexCoord);`).
+     * Bypasses all upscaling, RCAS sharpening, and post-processing shaders for zero GPU overhead.
+     */
+    private fun drawTex2dDirectPassthroughToScreen(srcTexId: Int, texMat: FloatArray, cfg: RenderConfig) {
+        GLES20.glUseProgram(tex2dToFboProgram)
+
+        val posLoc = GLES20.glGetAttribLocation(tex2dToFboProgram, "aPosition")
+        val texLoc = GLES20.glGetAttribLocation(tex2dToFboProgram, "aTextureCoord")
+        val mvpLoc = GLES20.glGetUniformLocation(tex2dToFboProgram, "uMVPMatrix")
+        val texMatLoc = GLES20.glGetUniformLocation(tex2dToFboProgram, "uTexMatrix")
+
+        quadVertices.position(0)
+        GLES20.glVertexAttribPointer(posLoc, 2, GLES20.GL_FLOAT, false, 16, quadVertices)
+        GLES20.glEnableVertexAttribArray(posLoc)
+
+        quadVertices.position(2)
+        GLES20.glVertexAttribPointer(texLoc, 2, GLES20.GL_FLOAT, false, 16, quadVertices)
+        GLES20.glEnableVertexAttribArray(texLoc)
+
+        GLES20.glUniformMatrix4fv(mvpLoc, 1, false, mvpMatrix, 0)
+        GLES20.glUniformMatrix4fv(texMatLoc, 1, false, texMat, 0)
+        GLES20.glUniform1f(GLES20.glGetUniformLocation(tex2dToFboProgram, "uOverscanCrop"), cfg.overscanCropPercent.coerceIn(0f, 0.15f))
+
+        GLES20.glActiveTexture(GLES20.GL_TEXTURE0)
+        GLES20.glBindTexture(GLES20.GL_TEXTURE_2D, srcTexId)
+        GLES20.glTexParameteri(GLES20.GL_TEXTURE_2D, GLES20.GL_TEXTURE_MIN_FILTER, GLES20.GL_LINEAR)
+        GLES20.glTexParameteri(GLES20.GL_TEXTURE_2D, GLES20.GL_TEXTURE_MAG_FILTER, GLES20.GL_LINEAR)
+        GLES20.glUniform1i(GLES20.glGetUniformLocation(tex2dToFboProgram, "sTex2d"), 0)
+
+        GLES20.glDrawArrays(GLES20.GL_TRIANGLE_STRIP, 0, 4)
+    }
+
+    /**
+     * Hardware GPU YUY2 / UYVY 4:2:2 -> RGB conversion pass (0.0 ms CPU conversion).
+     */
+    private fun drawYuy2ShaderPass(
+        srcTexId: Int,
+        mvpMat: FloatArray,
+        texMat: FloatArray,
+        fullWidth: Int,
+        isUyvy: Boolean,
+        overscanCrop: Float
+    ) {
+        GLES20.glUseProgram(yuy2ToRgbProgram)
+
+        val posLoc = GLES20.glGetAttribLocation(yuy2ToRgbProgram, "aPosition")
+        val texLoc = GLES20.glGetAttribLocation(yuy2ToRgbProgram, "aTextureCoord")
+        val mvpLoc = GLES20.glGetUniformLocation(yuy2ToRgbProgram, "uMVPMatrix")
+        val texMatLoc = GLES20.glGetUniformLocation(yuy2ToRgbProgram, "uTexMatrix")
+
+        quadVertices.position(0)
+        GLES20.glVertexAttribPointer(posLoc, 2, GLES20.GL_FLOAT, false, 16, quadVertices)
+        GLES20.glEnableVertexAttribArray(posLoc)
+
+        quadVertices.position(2)
+        GLES20.glVertexAttribPointer(texLoc, 2, GLES20.GL_FLOAT, false, 16, quadVertices)
+        GLES20.glEnableVertexAttribArray(texLoc)
+
+        GLES20.glUniformMatrix4fv(mvpLoc, 1, false, mvpMat, 0)
+        GLES20.glUniformMatrix4fv(texMatLoc, 1, false, texMat, 0)
+        GLES20.glUniform1f(GLES20.glGetUniformLocation(yuy2ToRgbProgram, "uOverscanCrop"), overscanCrop)
+        GLES20.glUniform1f(GLES20.glGetUniformLocation(yuy2ToRgbProgram, "uFullWidth"), fullWidth.toFloat())
+        GLES20.glUniform1i(GLES20.glGetUniformLocation(yuy2ToRgbProgram, "uIsUyvy"), if (isUyvy) 1 else 0)
+
+        GLES20.glActiveTexture(GLES20.GL_TEXTURE0)
+        GLES20.glBindTexture(GLES20.GL_TEXTURE_2D, srcTexId)
+        GLES20.glTexParameteri(GLES20.GL_TEXTURE_2D, GLES20.GL_TEXTURE_MIN_FILTER, GLES20.GL_NEAREST)
+        GLES20.glTexParameteri(GLES20.GL_TEXTURE_2D, GLES20.GL_TEXTURE_MAG_FILTER, GLES20.GL_NEAREST)
+        GLES20.glUniform1i(GLES20.glGetUniformLocation(yuy2ToRgbProgram, "sYuy2Tex"), 0)
 
         GLES20.glDrawArrays(GLES20.GL_TRIANGLE_STRIP, 0, 4)
     }

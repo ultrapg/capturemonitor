@@ -225,10 +225,15 @@ enum class TextureFilteringMode(
     val code: Int,
     val description: String
 ) {
+    OFF_PASSTHROUGH(
+        label = "Off (1:1 Direct Passthrough)",
+        code = -1,
+        description = "All upscaling & post-processing disabled. Displays raw capture card output 1:1 with zero shader overhead (Default)"
+    ),
     LINEAR(
         label = "Linear",
         code = 0,
-        description = "Hardware Linear texture filtering with zero overhead (Default)"
+        description = "Hardware Linear texture filtering with zero multi-tap overhead"
     ),
     AMD_FSR_1_0(
         label = "AMD FSR 1.0 (EASU + RCAS)",
@@ -348,7 +353,8 @@ enum class ColorSpaceMode(val label: String, val code: Int) {
 data class RenderConfig(
     val graphicsBackend: GraphicsBackend = GraphicsBackend.VULKAN,
     val aspectRatioPreset: AspectRatioPreset = AspectRatioPreset.STRETCH_FILL,
-    val filteringMode: TextureFilteringMode = TextureFilteringMode.LINEAR,
+    val filteringMode: TextureFilteringMode = TextureFilteringMode.OFF_PASSTHROUGH,
+    val directPassthrough1To1: Boolean = true,   // Bypasses all upscalers & post-processing shaders for pure 1:1 capture card output
     val frameGenMode: FrameGenMode = FrameGenMode.OFF,
     val frameGenMultiplier: FrameGenMultiplier = FrameGenMultiplier.AUTO_DISPLAY_HZ,
     val frameGenMotionScale: Float = 1.0f,       // 0.25 to 2.0 optical flow vector strength
@@ -360,7 +366,7 @@ data class RenderConfig(
     val contrast: Float = 1.0f,       // 0.5 to 2.0
     val saturation: Float = 1.0f,     // 0.0 to 2.0
     val gamma: Float = 1.0f,          // 0.5 to 2.2
-    val sharpness: Float = 0.25f,     // 0.0 to 1.0 (FSR RCAS / NIS / GSR / CAS strength)
+    val sharpness: Float = 0.0f,      // 0.0 to 1.0 (FSR RCAS / NIS / GSR / CAS strength; 0 by default for pure passthrough)
     val mirrorHorizontal: Boolean = false,
     val flipVertical: Boolean = false,
     val rotationDegrees: Int = 0,     // 0, 90, 180, 270

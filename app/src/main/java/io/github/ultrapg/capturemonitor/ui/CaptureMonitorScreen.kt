@@ -697,7 +697,7 @@ private fun SlideOverMonitorControlPanel(
                         color = Color.White
                     )
                     Text(
-                        text = "Swipe edge or press Back to hide • v0.5.0",
+                        text = "Swipe edge or press Back to hide • v0.6.4",
                         fontSize = 11.sp,
                         color = Color(0xFF94A3B8)
                     )
@@ -1158,6 +1158,55 @@ private fun CustomResolutionBuilderCard(
                 )
             }
         }
+
+        Spacer(Modifier.height(10.dp))
+        HorizontalDivider(color = Color.White.copy(alpha = 0.08f))
+        Spacer(Modifier.height(8.dp))
+
+        val isPassthrough = state.renderConfig.directPassthrough1To1 ||
+            state.renderConfig.filteringMode == TextureFilteringMode.OFF_PASSTHROUGH
+        Row(
+            verticalAlignment = Alignment.CenterVertically,
+            modifier = Modifier.fillMaxWidth()
+        ) {
+            Column(modifier = Modifier.weight(1f)) {
+                Text(
+                    text = "1:1 Direct Passthrough (Disable All Upscaling)",
+                    color = if (isPassthrough) StudioEmerald else Color.White,
+                    fontWeight = FontWeight.Bold,
+                    fontSize = 12.sp
+                )
+                Text(
+                    text = "Displays video 1:1 directly from the capture card with zero upscaler/shader overhead",
+                    color = Color(0xFF94A3B8),
+                    fontSize = 11.sp
+                )
+            }
+            Switch(
+                checked = isPassthrough,
+                onCheckedChange = { enabled ->
+                    viewModel.updateRenderConfig { cfg ->
+                        if (enabled) {
+                            cfg.copy(
+                                directPassthrough1To1 = true,
+                                filteringMode = TextureFilteringMode.OFF_PASSTHROUGH,
+                                frameGenMode = FrameGenMode.OFF,
+                                sharpness = 0f
+                            )
+                        } else {
+                            cfg.copy(
+                                directPassthrough1To1 = false,
+                                filteringMode = if (cfg.filteringMode == TextureFilteringMode.OFF_PASSTHROUGH) {
+                                    TextureFilteringMode.LINEAR
+                                } else {
+                                    cfg.filteringMode
+                                }
+                            )
+                        }
+                    }
+                }
+            )
+        }
     }
 }
 
@@ -1466,9 +1515,58 @@ private fun GpuAndAspectTab(
         title = "Hardware Upscaling & Super Resolution Filters",
         icon = Icons.Default.HighQuality
     ) {
+        val isPassthrough = cfg.directPassthrough1To1 || cfg.filteringMode == TextureFilteringMode.OFF_PASSTHROUGH
+        Row(
+            verticalAlignment = Alignment.CenterVertically,
+            modifier = Modifier
+                .fillMaxWidth()
+                .clip(RoundedCornerShape(10.dp))
+                .background(if (isPassthrough) StudioEmerald.copy(alpha = 0.14f) else Color(0xFF0F172A))
+                .padding(horizontal = 10.dp, vertical = 8.dp)
+        ) {
+            Column(modifier = Modifier.weight(1f)) {
+                Text(
+                    text = "Disable All Upscaling (1:1 Direct Passthrough)",
+                    color = if (isPassthrough) StudioEmerald else Color.White,
+                    fontWeight = FontWeight.Bold,
+                    fontSize = 12.sp
+                )
+                Text(
+                    text = "Displays frames 1:1 directly as received from the capture card with zero shader processing",
+                    color = Color(0xFF94A3B8),
+                    fontSize = 11.sp
+                )
+            }
+            Switch(
+                checked = isPassthrough,
+                onCheckedChange = { enabled ->
+                    viewModel.updateRenderConfig { current ->
+                        if (enabled) {
+                            current.copy(
+                                directPassthrough1To1 = true,
+                                filteringMode = TextureFilteringMode.OFF_PASSTHROUGH,
+                                frameGenMode = FrameGenMode.OFF,
+                                sharpness = 0f
+                            )
+                        } else {
+                            current.copy(
+                                directPassthrough1To1 = false,
+                                filteringMode = if (current.filteringMode == TextureFilteringMode.OFF_PASSTHROUGH) {
+                                    TextureFilteringMode.LINEAR
+                                } else {
+                                    current.filteringMode
+                                }
+                            )
+                        }
+                    }
+                }
+            )
+        }
+
+        Spacer(Modifier.height(8.dp))
         Text(
             text = "Active Filter: ${cfg.filteringMode.label}",
-            color = StudioCyan,
+            color = if (isPassthrough) StudioEmerald else StudioCyan,
             fontWeight = FontWeight.SemiBold,
             fontSize = 12.sp
         )
@@ -1486,24 +1584,41 @@ private fun GpuAndAspectTab(
                 val selected = cfg.filteringMode == mode
                 FilterChip(
                     selected = selected,
-                    onClick = { viewModel.updateRenderConfig { it.copy(filteringMode = mode) } },
+                    onClick = {
+                        viewModel.updateRenderConfig {
+                            it.copy(
+                                filteringMode = mode,
+                                directPassthrough1To1 = (mode == TextureFilteringMode.OFF_PASSTHROUGH)
+                            )
+                        }
+                    },
                     label = { Text(mode.label, fontSize = 11.sp) },
                     colors = FilterChipDefaults.filterChipColors(
-                        selectedContainerColor = StudioCyan.copy(alpha = 0.22f),
-                        selectedLabelColor = StudioCyan
+                        selectedContainerColor = if (mode == TextureFilteringMode.OFF_PASSTHROUGH) {
+                            StudioEmerald.copy(alpha = 0.22f)
+                        } else {
+                            StudioCyan.copy(alpha = 0.22f)
+                        },
+                        selectedLabelColor = if (mode == TextureFilteringMode.OFF_PASSTHROUGH) {
+                            StudioEmerald
+                        } else {
+                            StudioCyan
+                        }
                     )
                 )
             }
         }
 
-        Spacer(Modifier.height(8.dp))
-        LabeledSlider(
-            label = "Upscaler / FSR RCAS / NIS / GSR Sharpness",
-            valueText = "${(cfg.sharpness * 100).toInt()}%",
-            value = cfg.sharpness,
-            valueRange = 0f..1f,
-            onValueChange = { v -> viewModel.updateRenderConfig { it.copy(sharpness = v) } }
-        )
+        if (!isPassthrough) {
+            Spacer(Modifier.height(8.dp))
+            LabeledSlider(
+                label = "Upscaler / FSR RCAS / NIS / GSR Sharpness",
+                valueText = "${(cfg.sharpness * 100).toInt()}%",
+                value = cfg.sharpness,
+                valueRange = 0f..1f,
+                onValueChange = { v -> viewModel.updateRenderConfig { it.copy(sharpness = v) } }
+            )
+        }
     }
 
     SectionCard(
